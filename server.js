@@ -8,14 +8,15 @@
  *   DATABASE_URL, BOT_TOKEN, CHAT_ID
  *
  * Opcionais:
- *   PORT (10000)            INTERVALO_SYNC_MS (6000, 4000–30000)
- *   API_BACBO               SINAIS_ATIVOS (true)
- *   BARRA_PUREZA (82)       TETO_JANELA (8)
- *   PAINEL_TOKEN            KEEP_ALIVE_URL
- *   DATABASE_SSL=false      (Postgres local sem SSL)
+ *   PORT (10000)
+ *   INTERVALO_SYNC_MS (6000, 4000–30000)
+ *   KEEP_ALIVE_MS (60000, 15000–900000)
+ *   KEEP_ALIVE_URL
+ *   KEEP_ALIVE_URLS (lista separada por vírgulas)
+ *   PAINEL_TOKEN
+ *   DATABASE_SSL=false (local)
  *
- * A pasta ./bot é ESM (tem o seu próprio package.json com "type": "module"),
- * por isso é carregada com import() a partir deste ficheiro CommonJS.
+ * A pasta ./bot é ESM, por isso é carregada com import().
  */
 
 const express = require('express');
@@ -34,6 +35,18 @@ const CHAT_ID = process.env.CHAT_ID || '';
 const PAINEL_TOKEN = (process.env.PAINEL_TOKEN || '').trim();
 
 const INTERVALO_SYNC_MS = limitar(process.env.INTERVALO_SYNC_MS, 6000, 4000, 30000);
+const KEEP_ALIVE_MS = limitar(process.env.KEEP_ALIVE_MS, 60000, 15000, 900000);
+
+const KEEP_ALIVE_URLS = [...new Set(
+  [
+    process.env.KEEP_ALIVE_URL,
+    process.env.RENDER_EXTERNAL_URL,
+    process.env.PUBLIC_URL,
+    ...(process.env.KEEP_ALIVE_URLS || '').split(',').map((x) => x.trim())
+  ]
+    .filter(Boolean)
+    .map((url) => normalizarUrlSaude(url))
+)];
 
 function limitar(valor, padrao, minimo, maximo) {
   const n = Number.parseInt(valor, 10);
@@ -41,17 +54,69 @@ function limitar(valor, padrao, minimo, maximo) {
   return Math.max(minimo, Math.min(maximo, n));
 }
 
+function normalizarUrlSaude(url) {
+  if (!url) return '';
+  const base = String(url).trim().replace(/\/+$/, '');
+  if (!base) return '';
+  return base.includes('/health') ? base : `${base}/health`;
+}
+
 const runtime = {
   iniciadoEm: new Date().toISOString(),
   ultimoPainel: null,
   ultimoErro: null,
-  ciclos: 0
+  ciclos: 0,
+  ultimoKeepAlive: null,
+  ultimoKeepAliveUrl: null,
+  keepAliveAtivo: false
 };
 
-let bot = null; // { tickAndSnapshot, telegramConfigurado, getSql, closeDb }
+let bot = null;
 let server = null;
 let timer = null;
 let encerrando = false;
+let keepAliveTimer = null;
+
+/* =====================================================
+   KEEP-ALIVE ROBUSTO
+===================================================== */
+
+async function keepAliveTick() {
+  if (!KEEP_ALIVE_URLS.length) return;
+
+  runtime.keepAliveAtivo = true;
+
+  let sucesso = false;
+  let ultimaUrl = null;
+
+  for (const url of KEEP_ALIVE_URLS) {
+    try {
+      await fetch(url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'capunga-dados-keepalive/1.0'
+        },
+        signal: AbortSignal.timeout(10000)
+      });
+      sucesso = true;
+      ultimaUrl = url;
+      runtime.ultimoKeepAlive = new Date().toISOString();
+      runtime.ultimoKeepAliveUrl = url;
+      break;
+    } catch (erro) {
+      // tenta o próximo alvo
+    }
+  }
+
+  if (!sucesso) {
+    runtime.ultimoKeepAlive = null;
+    runtime.ultimoKeepAliveUrl = null;
+    runtime.keepAliveAtivo = false;
+  } else {
+    runtime.keepAliveAtivo = true;
+    runtime.ultimoKeepAliveUrl = ultimaUrl;
+  }
+}
 
 /* =====================================================
    CICLO DO BOT
@@ -61,6 +126,10 @@ async function ciclo() {
   if (encerrando) return;
 
   try {
+    if (!bot) {
+      throw new Error('Bot ainda não inicializado');
+    }
+
     const painel = await bot.tickAndSnapshot();
     runtime.ultimoPainel = painel;
     runtime.ultimoErro = painel.erro || null;
@@ -90,6 +159,7 @@ app.get('/', (_req, res) => {
 
 function saude(_req, res) {
   const p = runtime.ultimoPainel;
+
   res.json({
     sucesso: true,
     estado: encerrando ? 'encerrando' : 'online',
@@ -100,18 +170,23 @@ function saude(_req, res) {
     aoVivo: p ? p.aoVivo : false,
     retomado: p ? p.retomado : false,
     ultimaSincronizacao: p ? p.sincronizadoEm : null,
-    ultimoErro: runtime.ultimoErro
+    ultimoErro: runtime.ultimoErro,
+    ultimoKeepAlive: runtime.ultimoKeepAlive,
+    ultimoKeepAliveUrl: runtime.ultimoKeepAliveUrl,
+    keepAliveAtivo: runtime.keepAliveAtivo
   });
 }
 
 app.get('/health', saude);
-app.get('/api/health', saude); // usado pelo keep-alive interno do bot
+app.get('/api/health', saude);
 
 app.get('/status', async (_req, res) => {
   let dbOk = false;
   let totais = null;
 
   try {
+    if (!bot) throw new Error('bot nao inicializado');
+
     const sql = await bot.getSql();
     const linhas = await sql.query(
       'SELECT estado, COUNT(*)::int AS quantidade FROM bacbo_sinais GROUP BY estado'
@@ -147,6 +222,7 @@ app.get('/api/painel', (req, res) => {
       req.headers.authorization === `Bearer ${PAINEL_TOKEN}`;
     if (!ok) return res.status(401).json({ sucesso: false, erro: 'nao_autorizado' });
   }
+
   res.json(runtime.ultimoPainel || { sucesso: false, erro: 'iniciando' });
 });
 
@@ -176,9 +252,23 @@ async function iniciar() {
   await mig.migrate();
   console.log('[DB] Tabelas verificadas');
 
-  server = app.listen(PORT, () => {
+  server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[HTTP] Servidor iniciado na porta ${PORT}`);
   });
+
+  // Keep-alive interno para manter o processo vivo e avisar o Render/monitor
+  if (KEEP_ALIVE_URLS.length) {
+    keepAliveTimer = setInterval(() => {
+      keepAliveTick().catch(() => {});
+    }, KEEP_ALIVE_MS);
+
+    if (typeof keepAliveTimer.unref === 'function') keepAliveTimer.unref();
+  }
+
+  // primeira checagem rápida
+  setTimeout(() => {
+    keepAliveTick().catch(() => {});
+  }, 15000);
 
   ciclo();
   console.log('[BOT] CAPUNGA DADOS iniciado');
@@ -193,11 +283,18 @@ async function encerrar() {
     timer = null;
   }
 
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
+
   if (server) {
     await new Promise((resolve) => server.close(resolve));
   }
 
-  if (bot) await bot.closeDb().catch(() => undefined);
+  if (bot && typeof bot.closeDb === 'function') {
+    await bot.closeDb().catch(() => undefined);
+  }
 
   console.log('[BOT] Servidor encerrado');
 }
@@ -218,6 +315,10 @@ process.on('SIGINT', () => {
 
 process.on('unhandledRejection', (erro) => {
   console.error('[UNHANDLED]', erro);
+});
+
+process.on('uncaughtException', (erro) => {
+  console.error('[UNCAUGHT]', erro);
 });
 
 iniciar().catch((erro) => {
