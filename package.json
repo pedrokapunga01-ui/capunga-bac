@@ -1,1 +1,19 @@
-{"sucesso":true,"distribuicaoHistorica":[{"resultado":"Banca","quantidade":2374},{"resultado":"Empate","quantidade":536},{"resultado":"Jogador","quantidade":2445}],"qualidadeHistorico":{"total":5355,"semPontuacao":5140,"primeiroResultado":"2026-10-20T04:43:08.917Z","ultimoResultado":"2026-10-22T22:20:09.557Z"},"nota":"Estatísticas descritivas do histórico; não preveem resultados futuros."}
+{
+  "name": "dados-ao-bacbo-monitor",
+  "version": "1.0.0",
+  "description": "Servidor de monitorização e histórico",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "axios": "^1.8.4",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "pg": "^8.13.3"
+  }
+}
