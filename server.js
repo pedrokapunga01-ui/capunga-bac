@@ -347,3 +347,451 @@ async function fetchPrice(source = 'bybit-spot') {
 
   return p;
 }
+function ema(values, period) {
+  if (values.length < period) return null;
+
+  const k = 2 / (period + 1);
+  let v = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+
+  for (let i = period; i < values.length; i++) {
+    v = values[i] * k + v * (1 - k);
+  }
+
+  return v;
+}
+
+function rsi(values, period = 14) {
+  if (values.length < period + 1) return null;
+
+  let gains = 0;
+  let losses = 0;
+
+  for (let i = values.length - period; i < values.length; i++) {
+    const d = values[i] - values[i - 1];
+
+    if (d > 0) gains += d;
+    else losses -= d;
+  }
+
+  if (losses === 0) return gains === 0 ? 50 : 100;
+
+  const rs = (gains / period) / (losses / period);
+
+  return 100 - (100 / (1 + rs));
+}
+
+function atr(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+
+  const tr = [];
+
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i];
+    const pc = candles[i - 1].close;
+
+    tr.push(
+      Math.max(
+        c.high - c.low,
+        Math.abs(c.high - pc),
+        Math.abs(c.low - pc)
+      )
+    );
+  }
+
+  return tr.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+
+function adxApprox(candles, period = 14) {
+  if (candles.length < period + 2) return null;
+
+  let plus = 0;
+  let minus = 0;
+  let tr = 0;
+
+  for (let i = candles.length - period; i < candles.length; i++) {
+    const c = candles[i];
+    const p = candles[i - 1];
+
+    const up = c.high - p.high;
+    const down = p.low - c.low;
+
+    plus += up > down && up > 0 ? up : 0;
+    minus += down > up && down > 0 ? down : 0;
+
+    tr += Math.max(
+      c.high - c.low,
+      Math.abs(c.high - p.close),
+      Math.abs(c.low - p.close)
+    );
+  }
+
+  if (tr <= 0) return 0;
+
+  const pdi = 100 * plus / tr;
+  const mdi = 100 * minus / tr;
+
+  return pdi + mdi === 0
+    ? 0
+    : 100 * Math.abs(pdi - mdi) / (pdi + mdi);
+}
+
+function getFeatures(candles) {
+  const closes = candles.map(c => c.close);
+  const last = candles[candles.length - 1];
+
+  return {
+    close: last.close,
+    ema9: ema(closes, 9),
+    ema21: ema(closes, 21),
+    ema50: ema(closes, 50),
+    rsi: rsi(closes),
+    atr: atr(candles),
+    adx: adxApprox(candles),
+    candle: last
+  };
+}
+
+function analyze(m1, m5, m15) {
+  const a = getFeatures(m1);
+  const b = getFeatures(m5);
+  const c = getFeatures(m15);
+
+  const reasons = [];
+  let score = 0;
+
+  if (b.ema9 > b.ema21) {
+    score++;
+    reasons.push('EMA9 acima da EMA21 em 5m');
+  }
+
+  if (c.ema9 > c.ema21 && c.ema21 > c.ema50) {
+    score += 2;
+    reasons.push('Tendência ascendente confirmada em 15m');
+  }
+
+  if (b.rsi >= 50 && b.rsi <= 68) {
+    score++;
+    reasons.push('RSI de 5m em zona favorável');
+  }
+
+  if (b.close > b.ema9 && b.ema9 > b.ema21) {
+    score++;
+    reasons.push('Preço acima das médias curtas');
+  }
+
+  if (b.adx >= 18) {
+    score++;
+    reasons.push('Força de tendência suficiente');
+  }
+
+  if (a.close > a.ema9 && a.ema9 > a.ema21) {
+    score++;
+    reasons.push('Confirmação de momentum em 1m');
+  }
+
+  if (b.rsi > 72) {
+    score -= 2;
+    reasons.push('Penalização por RSI sobrecomprado');
+  }
+
+  if (c.ema9 < c.ema21) {
+    score -= 2;
+    reasons.push('Tendência de 15m não confirma compra');
+  }
+
+  if (
+    !Number.isFinite(b.atr) ||
+    b.atr <= 0 ||
+    !Number.isFinite(b.close)
+  ) {
+    return {
+      ok: false,
+      score,
+      reasons: ['Indicadores insuficientes'],
+      features: { m1: a, m5: b, m15: c }
+    };
+  }
+
+  const entry = b.close;
+
+  const slDist = Math.max(
+    b.atr * CFG.slAtr,
+    entry * CFG.slMinPct
+  );
+
+  const tpDist = Math.max(
+    b.atr * CFG.tpAtr,
+    entry * CFG.tpMinPct
+  );
+
+  const rr = tpDist / slDist;
+
+  const ok =
+    score >= CFG.minScore &&
+    rr >= CFG.minRR &&
+    entry > 0;
+
+  return {
+    ok,
+    direction: 'BUY',
+    score,
+    entry,
+    tp: entry + tpDist,
+    sl: entry - slDist,
+    tpPct: tpDist / entry * 100,
+    slPct: slDist / entry * 100,
+    rr,
+    reasons,
+    candleTime: b.candle.time,
+
+    features: {
+      m1: {
+        close: a.close,
+        ema9: a.ema9,
+        ema21: a.ema21
+      },
+      m5: {
+        close: b.close,
+        ema9: b.ema9,
+        ema21: b.ema21,
+        rsi: b.rsi,
+        atr: b.atr,
+        adx: b.adx
+      },
+      m15: {
+        close: c.close,
+        ema9: c.ema9,
+        ema21: c.ema21,
+        ema50: c.ema50
+      }
+    }
+  };
+}
+
+async function pendingSignal(client = pool) {
+  const { rows } = await client.query(
+    "SELECT * FROM trade_sinais WHERE estado='PENDENTE' ORDER BY id DESC LIMIT 1"
+  );
+
+  return rows[0] || null;
+}
+
+async function resolvePending(price, candles5m) {
+  const signal = await pendingSignal();
+
+  if (!signal) return;
+
+  const createdAt = new Date(signal.criado_em).getTime();
+  const expiresAt = new Date(signal.expiracao_em).getTime();
+
+  const sl = Number(signal.preco_sl);
+  const tp = Number(signal.preco_tp);
+  const entry = Number(signal.preco_entrada);
+
+  if (![createdAt, expiresAt, sl, tp, entry].every(Number.isFinite)) {
+    await logEvent(
+      'signal_data_error',
+      'Sinal pendente tem dados inválidos',
+      { id: signal.id }
+    );
+
+    return;
+  }
+
+  // Analisa as velas fechadas disponíveis desde a criação do sinal.
+  // Se TP e SL forem atingidos dentro da mesma vela, assume LOSS
+  // para evitar classificar o resultado de forma excessivamente otimista.
+
+  const eligibleCandles = (candles5m || []).filter(c => {
+    const candleCloseTime = c.time + 5 * 60000;
+
+    return candleCloseTime > createdAt && c.time < expiresAt;
+  });
+
+  for (const candle of eligibleCandles) {
+    let state = null;
+    let exit = null;
+
+    if (candle.low <= sl) {
+      state = 'LOSS';
+      exit = sl;
+    } else if (candle.high >= tp) {
+      state = 'GREEN';
+      exit = tp;
+    }
+
+    if (!state) continue;
+
+    const pnl = (exit - entry) / entry * 100;
+
+    const result = await pool.query(
+      `UPDATE trade_sinais
+       SET estado=$2,
+           preco_saida=$3,
+           pnl_pct=$4,
+           resolvido_em=NOW()
+       WHERE id=$1 AND estado='PENDENTE'
+       RETURNING id`,
+      [signal.id, state, exit, round(pnl, 5)]
+    );
+
+    if (!result.rowCount) return;
+
+    await logEvent('signal_resolved', `Sinal ${state}`, {
+      id: signal.id,
+      exit,
+      pnlPct: round(pnl, 5),
+      candleTime: candle.time
+    });
+
+    await telegramSend(
+      `${state === 'GREEN' ? '🟢 GREEN' : '🔴 LOSS'} — CAPUNGA TRADE\n` +
+      `Sinal #${signal.id} · BTC/USDT Spot\n` +
+      `Entrada de referência: ${round(entry, 2)}\n` +
+      `Saída simulada: ${round(exit, 2)}\n` +
+      `Variação bruta: ${round(pnl, 3)}%\n` +
+      `Resultado por vela fechada; taxas e slippage excluídos.`
+    );
+
+    return;
+  }
+
+  if (Date.now() >= expiresAt) {
+    const result = await pool.query(
+      `UPDATE trade_sinais
+       SET estado='EXPIRADO',
+           preco_saida=$2,
+           resolvido_em=NOW()
+       WHERE id=$1 AND estado='PENDENTE'
+       RETURNING id`,
+      [signal.id, price]
+    );
+
+    if (result.rowCount) {
+      await logEvent(
+        'signal_expired',
+        'Sinal expirado',
+        { id: signal.id, price }
+      );
+
+      await telegramSend(
+        `⌛ CAPUNGA TRADE — SINAL EXPIRADO\n` +
+        `#${signal.id} · BTC/USDT Spot\n` +
+        `Preço de referência: ${round(price, 2)}\n` +
+        `Expirado sem TP/SL confirmado nas velas disponíveis.`
+      );
+    }
+  }
+}
+
+async function createSignal(a, source) {
+  const client = await pool.connect();
+  let signal;
+
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtext('capunga_trade_signal_engine'))"
+    );
+
+    const pending = await pendingSignal(client);
+
+    if (pending) {
+      await client.query('COMMIT');
+
+      return {
+        opened: false,
+        reason: 'pending_exists',
+        id: pending.id
+      };
+    }
+
+    const recent = await client.query(
+      'SELECT criado_em FROM trade_sinais ORDER BY id DESC LIMIT 1'
+    );
+
+    if (
+      recent.rowCount &&
+      Date.now() - new Date(recent.rows[0].criado_em).getTime()
+        < CFG.antiSpamMs
+    ) {
+      await client.query('COMMIT');
+
+      return {
+        opened: false,
+        reason: 'cooldown'
+      };
+    }
+
+    const expires = new Date(Date.now() + CFG.expiryMs);
+
+    const result = await client.query(
+      `INSERT INTO trade_sinais
+       (symbol,direcao,preco_entrada,preco_tp,preco_sl,score,estado,
+        tp_pct,sl_pct,expiracao_em,metadados)
+       VALUES($1,'BUY',$2,$3,$4,$5,'PENDENTE',$6,$7,$8,$9::jsonb)
+       RETURNING id,criado_em`,
+      [
+        CFG.symbol,
+        a.entry,
+        a.tp,
+        a.sl,
+        a.score,
+        round(a.tpPct, 5),
+        round(a.slPct, 5),
+        expires,
+        JSON.stringify({
+          reasons: a.reasons,
+          rr: a.rr,
+          features: a.features,
+          source
+        })
+      ]
+    );
+
+    signal = result.rows[0];
+
+    await client.query('COMMIT');
+    lastSignalAt = Date.now();
+  } catch (e) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  await logEvent('signal_opened', 'Novo sinal BUY', {
+    id: signal.id,
+    entry: a.entry,
+    tp: a.tp,
+    sl: a.sl,
+    score: a.score,
+    source
+  });
+
+  const msg =
+    `📣 CAPUNGA TRADE — NOVO SINAL\n\n` +
+    `🟢 ATIVO: ${CFG.symbol.replace('USDT', '/USDT')} Spot\n` +
+    `📍 DIREÇÃO: BUY / COMPRA\n` +
+    `🆔 SINAL: #${signal.id}\n\n` +
+    `🎯 Entrada de referência: ${round(a.entry, 2)} USDT\n` +
+    `✅ Take Profit: ${round(a.tp, 2)} USDT (+${round(a.tpPct, 2)}%)\n` +
+    `🛑 Stop Loss: ${round(a.sl, 2)} USDT (-${round(a.slPct, 2)}%)\n` +
+    `⚖️ Relação R:R: ${round(a.rr, 2)}\n` +
+    `📊 Score: ${a.score}/8\n` +
+    `⏳ Validade: ${Math.round(CFG.expiryMs / 60000)} minutos\n\n` +
+    `🔎 Confirmações: ${a.reasons.join('; ')}\n` +
+    `📡 Fonte: ${source}\n\n` +
+    `⚠️ Sinal informativo para execução manual. Não é uma ordem; preço, taxas e slippage podem alterar o resultado.`;
+
+  await telegramSend(msg);
+
+  return {
+    opened: true,
+    id: signal.id
+  };
+}
