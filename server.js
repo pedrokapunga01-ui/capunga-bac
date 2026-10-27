@@ -795,3 +795,557 @@ async function createSignal(a, source) {
     id: signal.id
   };
 }
+function auth(req, res, next) {
+  if (!CFG.apiKey) {
+    return res.status(503).json({
+      ok: false,
+      error: 'API_KEY não configurada.'
+    });
+  }
+
+  const key = req.get('x-api-key');
+
+  if (typeof key !== 'string' || key !== CFG.apiKey) {
+    return res.status(401).json({
+      ok: false,
+      error: 'Chave API inválida.'
+    });
+  }
+
+  next();
+}
+
+function asyncRoute(fn) {
+  return (req, res, next) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
+}
+
+app.get('/', (_req, res) => {
+  res.json({
+    name: 'CAPUNGA TRADE Signal Server Pro',
+    version: '5.1.0',
+    market: 'BTC/USDT Spot',
+    mode: 'continuous manual signals',
+    ordersExecuted: false,
+    telegram: Boolean(CFG.botToken && CFG.chatId),
+    endpoints: [
+      '/health',
+      '/status',
+      '/sinais',
+      '/eventos',
+      'POST /scan',
+      'POST /validar-entrada',
+      '/placar'
+    ]
+  });
+});
+
+app.get('/health', asyncRoute(async (_req, res) => {
+  let db = 'up';
+
+  try {
+    await pool.query('SELECT 1');
+  } catch (_) {
+    db = 'down';
+  }
+
+  const ok = db === 'up' && !shuttingDown;
+
+  res.status(ok ? 200 : 503).json({
+    ok,
+    db,
+    uptimeSeconds: Math.floor(process.uptime()),
+    symbol: CFG.symbol,
+    market: 'Spot',
+    source: lastSource,
+    lastAnalysis: lastAnalysis?.at || null,
+    lastError,
+    consecutiveErrors,
+    telegramConfigured: Boolean(CFG.botToken && CFG.chatId),
+    ordersExecuted: false
+  });
+}));
+
+app.get('/status', asyncRoute(async (_req, res) => {
+  const { rows } = await pool.query(`
+    SELECT
+      COUNT(*) FILTER(WHERE estado='GREEN')::int AS green,
+      COUNT(*) FILTER(WHERE estado='LOSS')::int AS loss,
+      COUNT(*) FILTER(WHERE estado='PENDENTE')::int AS pending,
+      COUNT(*) FILTER(WHERE estado='EXPIRADO')::int AS expired
+    FROM trade_sinais
+  `);
+
+  const stats = rows[0];
+  const settled = stats.green + stats.loss;
+
+  const pnl = await pool.query(`
+    SELECT COALESCE(SUM(pnl_pct), 0)::float AS total_pnl_pct
+    FROM trade_sinais
+    WHERE estado IN ('GREEN', 'LOSS')
+  `);
+
+  res.json({
+    ok: true,
+    symbol: CFG.symbol,
+    market: 'Spot',
+    ordersExecuted: false,
+    source: lastSource,
+
+    config: {
+      loopMs: CFG.loopMs,
+      minScore: CFG.minScore,
+      minRR: CFG.minRR,
+      riskPct: CFG.riskPct * 100,
+      tpAtr: CFG.tpAtr,
+      slAtr: CFG.slAtr,
+      expiryMinutes: CFG.expiryMs / 60000,
+      antiSpamMinutes: CFG.antiSpamMs / 60000
+    },
+
+    stats: {
+      ...stats,
+      settled,
+      winrate: settled
+        ? round(stats.green / settled * 100, 2)
+        : null,
+      totalPnlPct: round(pnl.rows[0].total_pnl_pct, 3)
+    },
+
+    pending: await pendingSignal(),
+    lastAnalysis,
+    lastError,
+    telegramConfigured: Boolean(CFG.botToken && CFG.chatId)
+  });
+}));
+
+app.get('/sinais', asyncRoute(async (req, res) => {
+  const limit = Math.min(
+    100,
+    Math.max(1, Number(req.query.limit) || 20)
+  );
+
+  const { rows } = await pool.query(`
+    SELECT
+      id, symbol, direcao,
+      preco_entrada, preco_tp, preco_sl,
+      score, estado, tp_pct, sl_pct,
+      preco_saida, pnl_pct,
+      criado_em, resolvido_em, expiracao_em,
+      metadados
+    FROM trade_sinais
+    ORDER BY id DESC
+    LIMIT $1
+  `, [limit]);
+
+  res.json({
+    ok: true,
+    count: rows.length,
+    items: rows
+  });
+}));
+
+app.get('/eventos', auth, asyncRoute(async (req, res) => {
+  const limit = Math.min(
+    100,
+    Math.max(1, Number(req.query.limit) || 30)
+  );
+
+  const { rows } = await pool.query(`
+    SELECT id, tipo, mensagem, dados, criado_em
+    FROM trade_eventos
+    ORDER BY id DESC
+    LIMIT $1
+  `, [limit]);
+
+  res.json({
+    ok: true,
+    items: rows
+  });
+}));
+
+app.get('/placar', asyncRoute(async (_req, res) => {
+  const { rows } = await pool.query(`
+    SELECT
+      COUNT(*) FILTER(WHERE estado='GREEN')::int AS green,
+      COUNT(*) FILTER(WHERE estado='LOSS')::int AS loss,
+      COUNT(*) FILTER(WHERE estado='PENDENTE')::int AS pending,
+      COUNT(*) FILTER(WHERE estado='EXPIRADO')::int AS expired
+    FROM trade_sinais
+    WHERE criado_em >= date_trunc('day', NOW())
+  `);
+
+  const stats = rows[0];
+  const settled = stats.green + stats.loss;
+
+  res.json({
+    ok: true,
+    date: new Date().toISOString().slice(0, 10),
+    ...stats,
+    settled,
+    winrate: settled
+      ? round(stats.green / settled * 100, 2)
+      : null
+  });
+}));
+
+app.post('/scan', auth, asyncRoute(async (_req, res) => {
+  const result = await scanOnce();
+
+  res.json({
+    ok: true,
+    result
+  });
+}));
+
+app.post('/validar-entrada', auth, asyncRoute(async (req, res) => {
+  const id = Number(req.body?.signalId);
+  const capital = Number(req.body?.capital);
+
+  if (!Number.isSafeInteger(id) || id < 1) {
+    return res.status(400).json({
+      ok: false,
+      valid: false,
+      error: 'signalId inválido.'
+    });
+  }
+
+  if (!Number.isFinite(capital) || capital <= 0) {
+    return res.status(400).json({
+      ok: false,
+      valid: false,
+      error: 'capital deve ser positivo e expresso em USDT.'
+    });
+  }
+
+  const { rows } = await pool.query(
+    'SELECT * FROM trade_sinais WHERE id=$1',
+    [id]
+  );
+
+  const signal = rows[0];
+
+  if (!signal) {
+    return res.status(404).json({
+      ok: false,
+      valid: false,
+      error: 'Sinal não encontrado.'
+    });
+  }
+
+  if (
+    signal.estado !== 'PENDENTE' ||
+    Date.now() >= new Date(signal.expiracao_em).getTime()
+  ) {
+    return res.status(409).json({
+      ok: true,
+      valid: false,
+      reason: 'Sinal não está ativo ou expirou.'
+    });
+  }
+
+  const entry = Number(signal.preco_entrada);
+  const tp = Number(signal.preco_tp);
+  const sl = Number(signal.preco_sl);
+
+  const price = await fetchPrice(lastSource);
+  const deviation = Math.abs(price - entry) / entry;
+
+  if (
+    !(sl < price && price < tp) ||
+    deviation > CFG.maxDeviationPct
+  ) {
+    return res.status(409).json({
+      ok: true,
+      valid: false,
+      reason: 'Preço atual fora dos níveis de entrada ou demasiado afastado do sinal.',
+      signalEntry: entry,
+      currentPrice: price,
+      stopLoss: sl,
+      takeProfit: tp,
+      deviationPct: round(deviation * 100, 4),
+      maxDeviationPct: CFG.maxDeviationPct * 100
+    });
+  }
+
+  const riskBudget = capital * CFG.riskPct;
+  const qtyRisk = riskBudget / (price - sl);
+  const qtyCapital = capital / price;
+
+  const qty = Math.floor(
+    Math.min(qtyRisk, qtyCapital) * 1e6
+  ) / 1e6;
+
+  const exposure = qty * price;
+
+  if (qty <= 0 || exposure < 5) {
+    return res.status(422).json({
+      ok: true,
+      valid: false,
+      reason: 'Capital insuficiente para o mínimo indicativo de 5 USDT.',
+      exposureUsdt: round(exposure, 4)
+    });
+  }
+
+  res.json({
+    ok: true,
+    valid: true,
+    mode: 'manual',
+    ordersSent: false,
+    signalId: id,
+    symbol: signal.symbol,
+    signalEntryReference: entry,
+    assumedManualEntry: price,
+    currentPrice: price,
+    takeProfit: tp,
+    stopLoss: sl,
+    capitalUsdt: round(capital, 2),
+    riskPct: CFG.riskPct * 100,
+    riskBudgetUsdt: round(riskBudget, 4),
+    quantityBtc: round(qty, 6),
+    exposureUsdt: round(exposure, 4),
+    estimatedLossAtStopUsdt: round(qty * (price - sl), 4),
+    estimatedGrossProfitAtTargetUsdt: round(qty * (tp - price), 4),
+    rr: round((tp - price) / (price - sl), 2),
+    deviationPct: round(deviation * 100, 4),
+    warning: 'Estimativas sem taxas, spread ou slippage. Verifica os filtros mínimos da Bybit e confirma qualquer ordem manualmente.'
+  });
+}));
+
+app.use((err, _req, res, _next) => {
+  console.error('[HTTP]', errText(err));
+
+  res.status(500).json({
+    ok: false,
+    error: errText(err)
+  });
+});
+
+async function telegramCommand(text, chatId) {
+  if (!CFG.botToken || !CFG.allowTelegramCommands) return;
+
+  // Só aceita comandos no chat configurado.
+  if (String(chatId) !== String(CFG.chatId)) return;
+
+  const command = String(text || '')
+    .trim()
+    .split(/\s+/)[0]
+    .split('@')[0]
+    .toLowerCase();
+
+  const send = async msg =>
+    axios.post(
+      `https://api.telegram.org/bot${CFG.botToken}/sendMessage`,
+      {
+        chat_id: chatId,
+        text: msg,
+        disable_web_page_preview: true
+      },
+      { timeout: 10000 }
+    ).catch(e => console.error('[Telegram command]', errText(e)));
+
+  if (
+    command === '/start' ||
+    command === '/ajuda' ||
+    command === '/help'
+  ) {
+    return send(
+      '🤖 CAPUNGA TRADE Signal Server Pro\n' +
+      '/status — estado do motor\n' +
+      '/placar — resultados do dia\n' +
+      '/historico — últimos 10 sinais\n' +
+      '/scan — pedir análise agora\n\n' +
+      'Este bot envia sinais informativos; não executa ordens.'
+    );
+  }
+
+  if (command === '/status') {
+    const r = await pool.query(`
+      SELECT
+        COUNT(*) FILTER(WHERE estado='GREEN')::int AS green,
+        COUNT(*) FILTER(WHERE estado='LOSS')::int AS loss,
+        COUNT(*) FILTER(WHERE estado='PENDENTE')::int AS pending
+      FROM trade_sinais
+    `);
+
+    const s = r.rows[0];
+
+    return send(
+      `🛰 CAPUNGA TRADE\n` +
+      `Motor: ${scanning ? 'a analisar' : 'ativo'}\n` +
+      `Mercado: ${CFG.symbol} Spot\n` +
+      `Fonte: ${lastSource}\n` +
+      `GREEN: ${s.green} · LOSS: ${s.loss} · Pendentes: ${s.pending}\n` +
+      `Última análise: ${lastAnalysis?.at || 'ainda não realizada'}\n` +
+      `Erro atual: ${lastError || 'nenhum'}`
+    );
+  }
+
+  if (command === '/placar') {
+    const r = await pool.query(`
+      SELECT
+        COUNT(*) FILTER(WHERE estado='GREEN')::int AS green,
+        COUNT(*) FILTER(WHERE estado='LOSS')::int AS loss,
+        COUNT(*) FILTER(WHERE estado='PENDENTE')::int AS pending
+      FROM trade_sinais
+      WHERE criado_em >= date_trunc('day', NOW())
+    `);
+
+    const s = r.rows[0];
+    const settled = s.green + s.loss;
+
+    return send(
+      `🏆 PLACAR DO DIA\n` +
+      `🟢 GREEN: ${s.green}\n` +
+      `🔴 LOSS: ${s.loss}\n` +
+      `⏳ PENDENTES: ${s.pending}\n` +
+      `Precisão histórica apurada: ${
+        settled
+          ? round(s.green / settled * 100, 2) + '%'
+          : 'sem resultados concluídos'
+      }\n` +
+      `A precisão passada não garante resultados futuros.`
+    );
+  }
+
+  if (command === '/historico') {
+    const r = await pool.query(`
+      SELECT id, estado, preco_entrada, preco_saida, criado_em
+      FROM trade_sinais
+      ORDER BY id DESC
+      LIMIT 10
+    `);
+
+    const lines = r.rows.map(s =>
+      `#${s.id} ${s.estado} | entrada ${round(Number(s.preco_entrada), 2)} | saída ${
+        s.preco_saida ? round(Number(s.preco_saida), 2) : '—'
+      }`
+    ).join('\n');
+
+    return send(`📚 ÚLTIMOS SINAIS\n${lines || 'Ainda não existem sinais.'}`);
+  }
+
+  if (command === '/scan') {
+    await send('🔎 A analisar o mercado.');
+
+    try {
+      const result = await scanOnce();
+
+      await send(
+        `📊 RESULTADO DA ANÁLISE\n` +
+        `Ativo: ${CFG.symbol} Spot\n` +
+        `Preço: ${round(result.price, 2)} USDT\n` +
+        `Score: ${result.score}\n` +
+        `Sinal elegível: ${result.eligible ? 'SIM' : 'NÃO'}\n` +
+        `${
+          result.signalResult?.opened
+            ? 'Novo sinal #' + result.signalResult.id
+            : result.signalResult?.reason || 'Nenhum novo sinal.'
+        }`
+      );
+    } catch (e) {
+      await send('⚠️ A análise falhou: ' + errText(e));
+    }
+
+    return;
+  }
+}
+
+async function pollTelegram() {
+  if (!CFG.botToken || !CFG.allowTelegramCommands || shuttingDown) return;
+
+  try {
+    const { data } = await axios.get(
+      `https://api.telegram.org/bot${CFG.botToken}/getUpdates`,
+      {
+        params: {
+          offset: telegramOffset,
+          timeout: 0,
+          allowed_updates: JSON.stringify(['message'])
+        },
+        timeout: 10000
+      }
+    );
+
+    if (!data?.ok || !Array.isArray(data.result)) return;
+
+    for (const update of data.result) {
+      telegramOffset = Math.max(
+        telegramOffset,
+        Number(update.update_id) + 1
+      );
+
+      const msg = update.message;
+
+      if (msg?.text) {
+        await telegramCommand(msg.text, msg.chat?.id);
+      }
+    }
+  } catch (e) {
+    console.error('[Telegram poll]', errText(e));
+  }
+}
+
+async function shutdown() {
+  if (shuttingDown) return;
+
+  shuttingDown = true;
+
+  if (scanTimer) clearInterval(scanTimer);
+  if (keepaliveTimer) clearInterval(keepaliveTimer);
+  if (telegramTimer) clearInterval(telegramTimer);
+
+  if (server) {
+    await new Promise(resolve => server.close(resolve));
+  }
+
+  if (pool) await pool.end();
+
+  process.exit(0);
+}
+
+async function main() {
+  await initDB();
+
+  server = app.listen(CFG.port, '0.0.0.0', () => {
+    console.log(
+      `[HTTP] CAPUNGA TRADE Signal Server Pro v5.1 · BTC/USDT Spot · :${CFG.port}`
+    );
+  });
+
+  try {
+    await scanOnce();
+  } catch (e) {
+    console.error('[initial scan]', errText(e));
+  }
+
+  scanTimer = setInterval(() => {
+    scanOnce().catch(() => {});
+  }, CFG.loopMs);
+
+  if (CFG.keepaliveUrl) {
+    keepaliveTimer = setInterval(() => {
+      axios.get(
+        CFG.keepaliveUrl.replace(/\/$/, '') + '/health',
+        { timeout: 10000 }
+      ).catch(() => {});
+    }, 8 * 60 * 1000);
+  }
+
+  if (CFG.botToken && CFG.allowTelegramCommands) {
+    telegramTimer = setInterval(
+      () => pollTelegram().catch(() => {}),
+      CFG.telegramPollMs
+    );
+
+    pollTelegram().catch(() => {});
+  }
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
+
+main().catch(e => {
+  console.error('[FATAL]', errText(e));
+  process.exit(1);
+});
