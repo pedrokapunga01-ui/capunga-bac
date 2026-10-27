@@ -1,879 +1,349 @@
 'use strict';
 
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
-const crypto = require('crypto');
 
 const app = express();
-
 app.disable('x-powered-by');
+app.use(cors());
 app.use(express.json({ limit: '32kb' }));
 
-const PORT = Number(process.env.PORT || 10000);
-const API_BACBO = process.env.API_BACBO ||
-  'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo';
-
-const INTERVALO_SYNC_MS = Math.min(
-  60000,
-  Math.max(
-    5000,
-    Number.parseInt(process.env.INTERVALO_SYNC_MS || '8000', 10) || 8000
-  )
-);
-
-const BOT_TOKEN = process.env.BOT_TOKEN || '';
-const CHAT_ID = process.env.CHAT_ID || '';
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
-const TELEGRAM_NOTIFY_NEW_RESULT =
-  process.env.TELEGRAM_NOTIFY_NEW_RESULT === 'true';
-
-if (!process.env.DATABASE_URL) {
-  console.error('[FATAL] DATABASE_URL não configurada.');
-  process.exit(1);
+function numEnv(name, fallback, min, max) {
+  const n = Number(process.env[name] ?? fallback);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL)
-    ? false
-    : { rejectUnauthorized: false },
-  max: 5,
+function round(n, places = 2) {
+  const p = 10 ** places;
+  return Math.round((Number(n) + Number.EPSILON) * p) / p;
+}
+
+function errText(e) {
+  return String(e?.message || e || 'Unknown error').slice(0, 400);
+}
+
+const CFG = Object.freeze({
+  port: numEnv('PORT', 3000, 1, 65535),
+  symbol: String(process.env.SYMBOL || 'BTCUSDT').toUpperCase(),
+  category: 'spot',
+  bybitUrl: (process.env.BYBIT_BASE_URL || 'https://api.bybit.com').replace(/\/$/, ''),
+  loopMs: numEnv('LOOP_MS', 60000, 15000, 3600000),
+  minScore: numEnv('MIN_SCORE', 5, 3, 8),
+  minRR: numEnv('MIN_RR', 1.4, 1, 5),
+  riskPct: numEnv('RISK_PCT', 1, 0.1, 1) / 100,
+  maxDeviationPct: numEnv('MAX_ENTRY_DEVIATION_PCT', 0.35, 0.05, 3) / 100,
+  tpAtr: numEnv('ATR_TP_MULT', 1.8, 0.5, 10),
+  slAtr: numEnv('ATR_SL_MULT', 1.2, 0.5, 10),
+  tpMinPct: numEnv('TP_MIN_PCT', 0.25, 0.05, 5) / 100,
+  slMinPct: numEnv('SL_MIN_PCT', 0.20, 0.05, 5) / 100,
+  expiryMs: numEnv('SIGNAL_EXPIRY_MIN', 240, 15, 10080) * 60000,
+  antiSpamMs: numEnv('ANTI_SPAM_MIN', 60, 1, 1440) * 60000,
+  candleLimit: numEnv('CANDLE_LIMIT', 200, 100, 1000),
+  apiKey: process.env.API_KEY || '',
+  botToken: process.env.BOT_TOKEN || '',
+  chatId: process.env.CHAT_ID || '',
+  keepaliveUrl: process.env.KEEPALIVE_URL || '',
+  databaseUrl: process.env.DATABASE_URL || '',
+  databaseSsl: String(process.env.DATABASE_SSL || 'true').toLowerCase() !== 'false',
+  telegramPollMs: numEnv('TELEGRAM_POLL_MS', 4000, 1500, 30000),
+  allowTelegramCommands: String(process.env.TELEGRAM_COMMANDS || 'true').toLowerCase() !== 'false'
+});
+
+const pool = CFG.databaseUrl ? new Pool({
+  connectionString: CFG.databaseUrl,
+  ssl: CFG.databaseSsl ? { rejectUnauthorized: false } : false,
+  max: 8,
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-  statement_timeout: 15000
-});
-
-pool.on('error', err => {
-  console.error('[DB_POOL]', err.message);
-});
-
-const runtime = {
-  iniciadoEm: new Date().toISOString(),
-  ultimaSincronizacao: null,
-  ultimaSincronizacaoBemSucedida: null,
-  ultimoResultadoNovoEm: null,
-  ultimoId: null,
-  apiHttp: null,
-  apiLatenciaMs: null,
-  erroAPI: null,
-  erroDB: null,
-  ultimaMensagemTelegram: null,
-  erroTelegram: null,
-  itensBrutos: 0,
-  itensNormalizados: 0,
-  itensDescartados: 0,
-  novos: 0,
-  atualizados: 0,
-  inalterados: 0,
-  ciclosSemNovos: 0,
-  duracaoMs: null,
-  sincronizacaoEmCurso: false,
-  formatoResposta: null,
-  falhasConsecutivas: 0
-};
+  connectionTimeoutMillis: 10000
+}) : null;
 
 let server;
-let timer;
-let stopping = false;
+let scanTimer;
+let keepaliveTimer;
+let telegramTimer;
+let scanning = false;
+let shuttingDown = false;
+let lastAnalysis = null;
+let lastError = null;
+let lastSource = 'none';
+let lastSignalAt = 0;
+let telegramOffset = 0;
+let consecutiveErrors = 0;
 
-function nowAngola() {
-  return new Date().toLocaleString('pt-PT', {
-    timeZone: 'Africa/Luanda'
-  });
-}
+async function logEvent(type, message, data = {}) {
+  if (!pool) return;
 
-function safeError(err) {
-  return {
-    mensagem: String(err?.message || err).slice(0, 400),
-    codigo: err?.code || null,
-    http: err?.response?.status || null
-  };
-}
-
-function dateValue(value) {
-  if (value === null || value === undefined || value === '') {
-    return null;
-  }
-
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-
-function firstDefined(...values) {
-  return values.find(
-    value => value !== undefined &&
-      value !== null &&
-      value !== ''
-  );
-}
-
-function normalizeOutcome(value) {
-  const text = String(value || '').trim().toLowerCase();
-
-  if ([
-    'jogador', 'player', 'blue', 'playerwin', 'player_win'
-  ].includes(text)) return 'Jogador';
-
-  if ([
-    'banca', 'banker', 'red', 'bankerwin', 'banker_win'
-  ].includes(text)) return 'Banca';
-
-  if ([
-    'empate', 'tie', 'draw', 'egal'
-  ].includes(text)) return 'Empate';
-
-  return null;
-}
-
-function numeric(value) {
-  if (value === null || value === undefined || value === '') {
-    return null;
-  }
-
-  const result = Number(value);
-  return Number.isFinite(result) ? result : null;
-}
-
-function extractItems(body) {
-  if (Array.isArray(body)) return body;
-  if (!body || typeof body !== 'object') return [];
-
-  const candidates = [
-    body.data,
-    body.results,
-    body.items,
-    body.resultados,
-    body.rounds,
-    body.events,
-    body.records,
-    body.data?.results,
-    body.data?.items,
-    body.data?.rounds,
-    body.data?.events,
-    body.data?.resultados
-  ];
-
-  return candidates.find(Array.isArray) || [];
-}
-
-function normalizeRound(item) {
-  if (!item || typeof item !== 'object') return null;
-
-  const source = {
-    ...(item.data && typeof item.data === 'object' ? item.data : {}),
-    ...(item.round && typeof item.round === 'object' ? item.round : {}),
-    ...item
-  };
-
-  const id = firstDefined(
-    source.id,
-    source._id,
-    source.roundId,
-    source.round_id,
-    source.gameId,
-    source.game_id,
-    source.eventId,
-    source.event_id,
-    source.uuid
-  );
-
-  const outcome = normalizeOutcome(firstDefined(
-    source.result,
-    source.outcome,
-    source.winner,
-    source.winningSide,
-    source.winning_side,
-    source.winnerName,
-    source.statusResult
-  ));
-
-  const end = dateValue(firstDefined(
-    source.finishedAt,
-    source.finished_at,
-    source.endTime,
-    source.end_time,
-    source.endedAt,
-    source.ended_at,
-    source.createdAt,
-    source.created_at,
-    source.timestamp,
-    source.date,
-    source.time
-  ));
-
-  if (id === undefined || !outcome || !end) {
-    return null;
-  }
-
-  const status = String(
-    firstDefined(source.status, source.state, 'resolved')
-  ).slice(0, 50);
-
-  return {
-    id: String(id),
-    resultado: outcome,
-    estado: status,
-    inicio: dateValue(firstDefined(
-      source.startedAt,
-      source.started_at,
-      source.startTime,
-      source.start_time
-    )),
-    fim: end,
-    pontos_jogador: numeric(firstDefined(
-      source.playerScore,
-      source.player_score,
-      source.playerPoints,
-      source.player_points,
-      source.blueScore,
-      source.blue_score
-    )),
-    pontos_banca: numeric(firstDefined(
-      source.bankerScore,
-      source.banker_score,
-      source.bankerPoints,
-      source.banker_points,
-      source.redScore,
-      source.red_score
-    )),
-    multiplicador: firstDefined(
-      source.multiplier,
-      source.payoutMultiplier,
-      source.payout_multiplier
-    ) == null
-      ? null
-      : String(firstDefined(
-          source.multiplier,
-          source.payoutMultiplier,
-          source.payout_multiplier
-        )).slice(0, 40)
-  };
-}
-
-async function ensureSchema() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS bacbo_resultados (
-      id TEXT PRIMARY KEY,
-      resultado TEXT NOT NULL,
-      estado TEXT,
-      inicio TIMESTAMPTZ,
-      fim TIMESTAMPTZ NOT NULL,
-      pontos_jogador INTEGER,
-      pontos_banca INTEGER,
-      multiplicador TEXT,
-      guardado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      seq BIGSERIAL
-    )
-  `);
-
-  const columns = [
-    ['estado', 'TEXT'],
-    ['inicio', 'TIMESTAMPTZ'],
-    ['fim', 'TIMESTAMPTZ'],
-    ['pontos_jogador', 'INTEGER'],
-    ['pontos_banca', 'INTEGER'],
-    ['multiplicador', 'TEXT'],
-    ['guardado_em', 'TIMESTAMPTZ DEFAULT NOW()'],
-    ['seq', 'BIGSERIAL']
-  ];
-
-  for (const [name, type] of columns) {
+  try {
     await pool.query(
-      `ALTER TABLE bacbo_resultados
-       ADD COLUMN IF NOT EXISTS ${name} ${type}`
+      'INSERT INTO trade_eventos(tipo,mensagem,dados) VALUES($1,$2,$3)',
+      [type, message, JSON.stringify(data)]
+    );
+  } catch (e) {
+    console.error('[DB event]', errText(e));
+  }
+}
+
+async function initDB() {
+  if (!pool) {
+    throw new Error(
+      'DATABASE_URL não configurado. PostgreSQL é obrigatório para histórico e controlo de duplicados.'
     );
   }
 
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS bacbo_resultados_fim_idx
-    ON bacbo_resultados (fim DESC)
+    CREATE TABLE IF NOT EXISTS trade_sinais (
+      id BIGSERIAL PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direcao TEXT NOT NULL DEFAULT 'BUY',
+      preco_entrada NUMERIC NOT NULL,
+      preco_tp NUMERIC NOT NULL,
+      preco_sl NUMERIC NOT NULL,
+      score INTEGER NOT NULL,
+      estado TEXT NOT NULL DEFAULT 'PENDENTE',
+      tp_pct NUMERIC NOT NULL,
+      sl_pct NUMERIC NOT NULL,
+      preco_saida NUMERIC,
+      pnl_pct NUMERIC,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      resolvido_em TIMESTAMPTZ,
+      expiracao_em TIMESTAMPTZ NOT NULL,
+      metadados JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+
+    CREATE INDEX IF NOT EXISTS trade_sinais_estado_idx
+      ON trade_sinais(estado, criado_em DESC);
+
+    CREATE INDEX IF NOT EXISTS trade_sinais_criado_idx
+      ON trade_sinais(criado_em DESC);
+
+    CREATE TABLE IF NOT EXISTS trade_eventos (
+      id BIGSERIAL PRIMARY KEY,
+      tipo TEXT NOT NULL,
+      mensagem TEXT NOT NULL,
+      dados JSONB NOT NULL DEFAULT '{}'::jsonb,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS trade_config (
+      chave TEXT PRIMARY KEY,
+      valor TEXT NOT NULL,
+      atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // Migrações para bases de dados de versões anteriores.
+  await pool.query(`
+    ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_tp NUMERIC;
+    ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_sl NUMERIC;
+    ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS tp_pct NUMERIC;
+    ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS sl_pct NUMERIC;
+    ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS preco_saida NUMERIC;
+    ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS pnl_pct NUMERIC;
+    ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS resolvido_em TIMESTAMPTZ;
+    ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS expiracao_em TIMESTAMPTZ;
+    ALTER TABLE trade_sinais ADD COLUMN IF NOT EXISTS metadados JSONB NOT NULL DEFAULT '{}'::jsonb;
   `);
 
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS bacbo_resultados_seq_idx
-    ON bacbo_resultados (seq DESC)
+    UPDATE trade_sinais
+    SET expiracao_em = COALESCE(
+      expiracao_em,
+      criado_em + INTERVAL '4 hours'
+    )
+    WHERE expiracao_em IS NULL
   `);
 
-  console.log('[DB] Estrutura verificada; histórico preservado.');
+  const { rows } = await pool.query(
+    'SELECT EXTRACT(EPOCH FROM MAX(criado_em))*1000 AS last_ms FROM trade_sinais'
+  );
+
+  lastSignalAt = Number(rows[0]?.last_ms || 0);
 }
 
-async function telegramSend(message) {
-  if (!BOT_TOKEN || !CHAT_ID) {
-    runtime.erroTelegram =
-      'Configure BOT_TOKEN e CHAT_ID nas variáveis do Render.';
-    return false;
+async function telegramSend(text) {
+  if (!CFG.botToken || !CFG.chatId) {
+    return { skipped: true, reason: 'Telegram not configured' };
   }
 
   try {
-    const response = await axios.post(
-      `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+    const { data } = await axios.post(
+      `https://api.telegram.org/bot${CFG.botToken}/sendMessage`,
       {
-        chat_id: CHAT_ID,
-        text: message,
+        chat_id: CFG.chatId,
+        text,
         disable_web_page_preview: true
       },
-      { timeout: 10000 }
+      { timeout: 12000 }
     );
 
-    if (!response.data?.ok) {
-      throw new Error('Telegram não confirmou a mensagem.');
+    if (!data?.ok) {
+      throw new Error(data?.description || 'Telegram API rejected message');
     }
 
-    runtime.ultimaMensagemTelegram = new Date().toISOString();
-    runtime.erroTelegram = null;
-    return true;
-  } catch (err) {
-    runtime.erroTelegram = safeError(err);
-    console.error('[TELEGRAM]', JSON.stringify(runtime.erroTelegram));
-    return false;
-  }
-}
-
-async function fetchRounds() {
-  const started = Date.now();
-
-  try {
-    const response = await axios.get(API_BACBO, {
-      timeout: 20000,
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'DadosAO-Monitor/2.0'
-      },
-      validateStatus: status => status >= 200 && status < 300
-    });
-
-    runtime.apiHttp = response.status;
-    runtime.apiLatenciaMs = Date.now() - started;
-    runtime.erroAPI = null;
-
-    const body = response.data;
-
-    runtime.formatoResposta = Array.isArray(body)
-      ? 'array'
-      : body && typeof body === 'object'
-        ? Object.keys(body).slice(0, 25)
-        : typeof body;
-
-    const items = extractItems(body);
-    runtime.itensBrutos = items.length;
-
-    const unique = new Map();
-    let discarded = 0;
-
-    for (const item of items) {
-      const round = normalizeRound(item);
-
-      if (!round) {
-        discarded++;
-        continue;
-      }
-
-      unique.set(round.id, round);
-    }
-
-    const rounds = [...unique.values()]
-      .sort((a, b) => a.fim - b.fim);
-
-    runtime.itensNormalizados = rounds.length;
-    runtime.itensDescartados = discarded;
-
-    if (items.length > 0 && rounds.length === 0) {
-      runtime.erroAPI = {
-        mensagem: 'A API devolveu dados, mas nenhum resultado foi reconhecido.'
-      };
-    }
-
-    return rounds;
-  } catch (err) {
-    runtime.apiLatenciaMs = Date.now() - started;
-    runtime.erroAPI = safeError(err);
-
-    if (err.response) {
-      runtime.apiHttp = err.response.status;
-    }
-
-    throw err;
-  }
-}
-
-async function saveRound(round) {
-  const inserted = await pool.query(`
-    INSERT INTO bacbo_resultados (
-      id, resultado, estado, inicio, fim,
-      pontos_jogador, pontos_banca, multiplicador, guardado_em
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-    ON CONFLICT (id) DO NOTHING
-    RETURNING id
-  `, [
-    round.id,
-    round.resultado,
-    round.estado,
-    round.inicio,
-    round.fim,
-    round.pontos_jogador,
-    round.pontos_banca,
-    round.multiplicador
-  ]);
-
-  if (inserted.rowCount > 0) {
-    return 'novo';
-  }
-
-  const updated = await pool.query(`
-    UPDATE bacbo_resultados SET
-      resultado=$2,
-      estado=$3,
-      inicio=$4,
-      fim=$5,
-      pontos_jogador=$6,
-      pontos_banca=$7,
-      multiplicador=$8
-    WHERE id=$1 AND (
-      resultado IS DISTINCT FROM $2 OR
-      estado IS DISTINCT FROM $3 OR
-      inicio IS DISTINCT FROM $4 OR
-      fim IS DISTINCT FROM $5 OR
-      pontos_jogador IS DISTINCT FROM $6 OR
-      pontos_banca IS DISTINCT FROM $7 OR
-      multiplicador IS DISTINCT FROM $8
-    )
-    RETURNING id
-  `, [
-    round.id,
-    round.resultado,
-    round.estado,
-    round.inicio,
-    round.fim,
-    round.pontos_jogador,
-    round.pontos_banca,
-    round.multiplicador
-  ]);
-
-  return updated.rowCount > 0 ? 'atualizado' : 'inalterado';
-}
-
-async function syncOnce() {
-  if (runtime.sincronizacaoEmCurso || stopping) {
-    return { ignorado: true };
-  }
-
-  runtime.sincronizacaoEmCurso = true;
-  const started = Date.now();
-
-  let novos = 0;
-  let atualizados = 0;
-  let inalterados = 0;
-
-  try {
-    const rounds = await fetchRounds();
-
-    for (const round of rounds) {
-      const result = await saveRound(round);
-
-      if (result === 'novo') {
-        novos++;
-        runtime.ultimoResultadoNovoEm = new Date().toISOString();
-        runtime.ultimoId = round.id;
-
-        if (TELEGRAM_NOTIFY_NEW_RESULT) {
-          await telegramSend(
-            'Dados AO — novo resultado registado\n' +
-            `Resultado: ${round.resultado}\n` +
-            `Hora: ${round.fim.toISOString()}\n` +
-            'Mensagem informativa; não é recomendação de aposta.'
-          );
-        }
-      } else if (result === 'atualizado') {
-        atualizados++;
-      } else {
-        inalterados++;
-      }
-    }
-
-    runtime.ultimaSincronizacao = new Date().toISOString();
-    runtime.ultimaSincronizacaoBemSucedida =
-      runtime.ultimaSincronizacao;
-
-    runtime.novos = novos;
-    runtime.atualizados = atualizados;
-    runtime.inalterados = inalterados;
-    runtime.ciclosSemNovos = novos
-      ? 0
-      : runtime.ciclosSemNovos + 1;
-
-    runtime.erroDB = null;
-    runtime.falhasConsecutivas = 0;
-
-    if (novos || atualizados) {
-      console.log('[SYNC]', JSON.stringify({
-        sucesso: true,
-        recebidos: runtime.itensBrutos,
-        normalizados: rounds.length,
-        novos,
-        atualizados,
-        inalterados
-      }));
-    }
+    return { sent: true };
+  } catch (e) {
+    await logEvent('telegram_error', errText(e));
+    console.error('[Telegram send]', errText(e));
 
     return {
-      sucesso: true,
-      recebidos: runtime.itensBrutos,
-      normalizados: rounds.length,
-      novos,
-      atualizados,
-      inalterados
+      sent: false,
+      error: errText(e)
     };
-  } catch (err) {
-    runtime.falhasConsecutivas++;
-    runtime.erroDB = safeError(err);
-
-    console.error('[SYNC]', JSON.stringify({
-      erro: safeError(err),
-      falhasConsecutivas: runtime.falhasConsecutivas
-    }));
-
-    return { sucesso: false, erro: safeError(err) };
-  } finally {
-    runtime.duracaoMs = Date.now() - started;
-    runtime.sincronizacaoEmCurso = false;
   }
 }
 
-function requireAdmin(req, res, next) {
-  if (!ADMIN_TOKEN) {
-    return res.status(503).json({
-      sucesso: false,
-      erro: 'ADMIN_TOKEN não configurado.'
-    });
-  }
-
-  const supplied = req.get('x-admin-token') || '';
-  const a = Buffer.from(supplied);
-  const b = Buffer.from(ADMIN_TOKEN);
-
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    return res.status(401).json({
-      sucesso: false,
-      erro: 'Não autorizado.'
-    });
-  }
-
-  next();
-}
-
-function diagnostics() {
-  return {
-    iniciadoEm: runtime.iniciadoEm,
-    ultimaSincronizacao: runtime.ultimaSincronizacao,
-    ultimaSincronizacaoBemSucedida:
-      runtime.ultimaSincronizacaoBemSucedida,
-    ultimoResultadoNovoEm: runtime.ultimoResultadoNovoEm,
-    api: {
-      http: runtime.apiHttp,
-      latenciaMs: runtime.apiLatenciaMs,
-      erro: runtime.erroAPI,
-      formatoResposta: runtime.formatoResposta
-    },
-    recolha: {
-      itensBrutos: runtime.itensBrutos,
-      itensNormalizados: runtime.itensNormalizados,
-      itensDescartados: runtime.itensDescartados,
-      novos: runtime.novos,
-      atualizados: runtime.atualizados,
-      inalterados: runtime.inalterados,
-      ciclosSemNovos: runtime.ciclosSemNovos,
-      duracaoMs: runtime.duracaoMs
-    },
-    baseDados: { erro: runtime.erroDB },
-    telegram: {
-      configurado: Boolean(BOT_TOKEN && CHAT_ID),
-      ultimaMensagem: runtime.ultimaMensagemTelegram,
-      erro: runtime.erroTelegram
-    },
-    falhasConsecutivas: runtime.falhasConsecutivas,
-    sincronizacaoEmCurso: runtime.sincronizacaoEmCurso
-  };
-}
-
-app.use(cors({
-  origin: process.env.CORS_ORIGIN
-    ? process.env.CORS_ORIGIN.split(',').map(v => v.trim())
-    : false
-}));
-
-app.get('/', (req, res) => {
-  res.json({
-    nome: 'Capunga Dados — BAC BO Monitor',
-    estado: 'online',
-    horaAngola: nowAngola(),
-    rotas: [
-      '/health',
-      '/diagnostico',
-      '/resultados',
-      '/estatisticas'
-    ]
-  });
-});
-
-app.get('/health', async (req, res) => {
-  let dbOk = false;
-
-  try {
-    await pool.query('SELECT 1');
-    dbOk = true;
-  } catch (_) {}
-
-  const last = runtime.ultimaSincronizacaoBemSucedida
-    ? Date.now() -
-      new Date(runtime.ultimaSincronizacaoBemSucedida).getTime()
-    : null;
-
-  const stale = last === null ||
-    last > Math.max(120000, INTERVALO_SYNC_MS * 5);
-
-  const healthy = dbOk && !stale;
-
-  res.status(healthy ? 200 : 503).json({
-    estado: healthy ? 'saudavel' : 'degradado',
-    servidor: 'online',
-    baseDados: dbOk ? 'online' : 'indisponivel',
-    sincronizacaoDesatualizada: stale,
-    idadeUltimaSincronizacaoMs: last,
-    horaAngola: nowAngola()
-  });
-});
-
-app.get('/diagnostico', async (req, res) => {
-  try {
-    const total = await pool.query(`
-      SELECT COUNT(*)::bigint AS total
-      FROM bacbo_resultados
-    `);
-
-    const latest = await pool.query(`
-      SELECT id, resultado, estado, inicio, fim,
-        pontos_jogador, pontos_banca, multiplicador, guardado_em
-      FROM bacbo_resultados
-      ORDER BY fim DESC NULLS LAST, seq DESC
-      LIMIT 1
-    `);
-
-    const recent = await pool.query(`
-      SELECT id, resultado, estado, fim,
-        pontos_jogador, pontos_banca, multiplicador
-      FROM bacbo_resultados
-      ORDER BY fim DESC NULLS LAST, seq DESC
-      LIMIT 10
-    `);
-
-    res.json({
-      sucesso: !runtime.erroDB,
-      nome: 'Capunga Dados — BAC BO Monitor',
-      horaAngola: nowAngola(),
-      totalResultados: Number(total.rows[0].total),
-      ultimoResultado: latest.rows[0] || null,
-      recentes: recent.rows,
-      sincronizacao: diagnostics()
-    });
-  } catch (err) {
-    res.status(500).json({
-      sucesso: false,
-      erro: safeError(err),
-      sincronizacao: diagnostics()
-    });
-  }
-});
-
-app.get('/resultados', async (req, res) => {
-  const parsed = Number.parseInt(req.query.limit || '50', 10);
-  const limit = Math.min(500, Math.max(1, parsed || 50));
-  const before = req.query.before
-    ? dateValue(req.query.before)
-    : null;
-
-  if (req.query.before && !before) {
-    return res.status(400).json({
-      sucesso: false,
-      erro: 'O parâmetro before deve ser uma data válida.'
-    });
-  }
-
-  try {
-    const result = before
-      ? await pool.query(`
-          SELECT id, resultado, estado, inicio, fim,
-            pontos_jogador, pontos_banca, multiplicador, guardado_em
-          FROM bacbo_resultados
-          WHERE fim < $1
-          ORDER BY fim DESC NULLS LAST, seq DESC
-          LIMIT $2
-        `, [before, limit])
-      : await pool.query(`
-          SELECT id, resultado, estado, inicio, fim,
-            pontos_jogador, pontos_banca, multiplicador, guardado_em
-          FROM bacbo_resultados
-          ORDER BY fim DESC NULLS LAST, seq DESC
-          LIMIT $1
-        `, [limit]);
-
-    res.json({
-      sucesso: true,
-      quantidade: result.rowCount,
-      limite: limit,
-      proximaPaginaAntesDe: result.rows.length
-        ? result.rows[result.rows.length - 1].fim
-        : null,
-      resultados: result.rows
-    });
-  } catch (err) {
-    res.status(500).json({
-      sucesso: false,
-      erro: safeError(err)
-    });
-  }
-});
-
-app.get('/estatisticas', async (req, res) => {
-  try {
-    const counts = await pool.query(`
-      SELECT resultado, COUNT(*)::bigint AS quantidade
-      FROM bacbo_resultados
-      GROUP BY resultado
-      ORDER BY resultado
-    `);
-
-    const quality = await pool.query(`
-      SELECT
-        COUNT(*)::bigint AS total,
-        COUNT(*) FILTER (
-          WHERE pontos_jogador IS NULL OR pontos_banca IS NULL
-        )::bigint AS sem_pontuacao,
-        MIN(fim) AS primeiro_resultado,
-        MAX(fim) AS ultimo_resultado
-      FROM bacbo_resultados
-    `);
-
-    res.json({
-      sucesso: true,
-      distribuicaoHistorica: counts.rows.map(row => ({
-        resultado: row.resultado,
-        quantidade: Number(row.quantidade)
-      })),
-      qualidadeHistorico: {
-        total: Number(quality.rows[0].total),
-        semPontuacao: Number(quality.rows[0].sem_pontuacao),
-        primeiroResultado: quality.rows[0].primeiro_resultado,
-        ultimoResultado: quality.rows[0].ultimo_resultado
+async function fetchBybitCandles(interval) {
+  const { data } = await axios.get(
+    `${CFG.bybitUrl}/v5/market/kline`,
+    {
+      params: {
+        category: 'spot',
+        symbol: CFG.symbol,
+        interval: String(interval),
+        limit: CFG.candleLimit
       },
-      nota: 'Estatísticas descritivas do histórico; não preveem resultados futuros.'
-    });
-  } catch (err) {
-    res.status(500).json({
-      sucesso: false,
-      erro: safeError(err)
-    });
-  }
-});
-
-app.post('/db/preparar', requireAdmin, async (req, res) => {
-  try {
-    await ensureSchema();
-    res.json({
-      sucesso: true,
-      mensagem: 'Estrutura verificada; histórico preservado.'
-    });
-  } catch (err) {
-    res.status(500).json({
-      sucesso: false,
-      erro: safeError(err)
-    });
-  }
-});
-
-app.post('/db/sincronizar', requireAdmin, async (req, res) => {
-  const result = await syncOnce();
-  res.status(result.sucesso === false ? 502 : 200).json(result);
-});
-
-app.post('/telegram/teste', requireAdmin, async (req, res) => {
-  const ok = await telegramSend(
-    'Dados AO — teste de comunicação do monitor. Mensagem informativa.'
+      timeout: 12000
+    }
   );
 
-  res.status(ok ? 200 : 502).json({ sucesso: ok });
-});
+  if (data?.retCode !== 0 || !Array.isArray(data?.result?.list)) {
+    throw new Error(`Bybit kline: ${data?.retMsg || 'resposta inválida'}`);
+  }
 
-app.use((req, res) => {
-  res.status(404).json({
-    sucesso: false,
-    erro: 'Rota não encontrada.'
-  });
-});
+  const ms = Number(interval) * 60000;
 
-app.use((err, req, res, next) => {
-  console.error('[HTTP]', safeError(err));
+  return data.result.list
+    .map(r => ({
+      time: Number(r[0]),
+      open: Number(r[1]),
+      high: Number(r[2]),
+      low: Number(r[3]),
+      close: Number(r[4]),
+      volume: Number(r[5])
+    }))
+    .filter(c =>
+      [c.time, c.open, c.high, c.low, c.close, c.volume]
+        .every(Number.isFinite) && c.close > 0
+    )
+    .sort((a, b) => a.time - b.time)
+    .filter(c => c.time + ms <= Date.now());
+}
 
-  if (res.headersSent) return next(err);
+async function fetchOkxCandles(interval) {
+  const instId = CFG.symbol.replace(/USDT$/, '-USDT');
 
-  res.status(500).json({
-    sucesso: false,
-    erro: 'Erro interno do servidor.'
-  });
-});
-
-async function start() {
-  await ensureSchema();
-
-  server = app.listen(PORT, '0.0.0.0', () => {
-    console.log('[START]', JSON.stringify({
-      nome: 'CAPUNGA DADOS — BAC BO MONITOR',
-      porta: PORT,
-      intervaloSyncMs: INTERVALO_SYNC_MS,
-      horaAngola: nowAngola()
-    }));
-  });
-
-  await syncOnce();
-
-  timer = setInterval(() => {
-    if (!runtime.sincronizacaoEmCurso && !stopping) {
-      syncOnce();
+  const { data } = await axios.get(
+    'https://www.okx.com/api/v5/market/candles',
+    {
+      params: {
+        instId,
+        bar: `${interval}m`,
+        limit: String(Math.min(CFG.candleLimit, 300))
+      },
+      timeout: 12000
     }
-  }, INTERVALO_SYNC_MS);
-}
+  );
 
-async function shutdown(signal) {
-  if (stopping) return;
-  stopping = true;
-
-  console.log('[SHUTDOWN]', signal);
-
-  if (timer) clearInterval(timer);
-
-  if (server) {
-    await new Promise(resolve => server.close(resolve));
+  if (data?.code !== '0' || !Array.isArray(data?.data)) {
+    throw new Error('OKX candles response invalid');
   }
 
+  const ms = Number(interval) * 60000;
+
+  return data.data
+    .map(r => ({
+      time: Number(r[0]),
+      open: Number(r[1]),
+      high: Number(r[2]),
+      low: Number(r[3]),
+      close: Number(r[4]),
+      volume: Number(r[5])
+    }))
+    .filter(c =>
+      [c.time, c.open, c.high, c.low, c.close, c.volume]
+        .every(Number.isFinite) && c.close > 0
+    )
+    .sort((a, b) => a.time - b.time)
+    .filter(c => c.time + ms <= Date.now());
+}
+
+async function fetchMarketBundle() {
+  // Utiliza a mesma corretora nos três períodos.
   try {
-    await pool.end();
-  } catch (err) {
-    console.error('[DB_CLOSE]', safeError(err));
-  }
+    const [m1, m5, m15] = await Promise.all([
+      fetchBybitCandles(1),
+      fetchBybitCandles(5),
+      fetchBybitCandles(15)
+    ]);
 
-  process.exit(0);
+    if ([m1, m5, m15].some(a => a.length < 60)) {
+      throw new Error('Bybit returned insufficient closed candles');
+    }
+
+    lastSource = 'bybit-spot';
+    return { m1, m5, m15, source: lastSource };
+  } catch (bybitError) {
+    try {
+      const [m1, m5, m15] = await Promise.all([
+        fetchOkxCandles(1),
+        fetchOkxCandles(5),
+        fetchOkxCandles(15)
+      ]);
+
+      if ([m1, m5, m15].some(a => a.length < 60)) {
+        throw new Error('OKX returned insufficient closed candles');
+      }
+
+      lastSource = 'okx-spot-fallback';
+      return { m1, m5, m15, source: lastSource };
+    } catch (okxError) {
+      throw new Error(
+        `Market data unavailable. Bybit: ${errText(bybitError)}; OKX: ${errText(okxError)}`
+      );
+    }
+  }
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+async function fetchPrice(source = 'bybit-spot') {
+  if (source === 'okx-spot-fallback') {
+    const instId = CFG.symbol.replace(/USDT$/, '-USDT');
 
-process.on('unhandledRejection', err => {
-  console.error('[UNHANDLED_REJECTION]', safeError(err));
-});
+    const { data } = await axios.get(
+      'https://www.okx.com/api/v5/market/ticker',
+      {
+        params: { instId },
+        timeout: 10000
+      }
+    );
 
-start().catch(err => {
-  console.error('[FATAL_STARTUP]', safeError(err));
-  process.exit(1);
-});
+    const p = Number(data?.data?.[0]?.last);
+
+    if (data?.code !== '0' || !Number.isFinite(p) || p <= 0) {
+      throw new Error('OKX ticker unavailable');
+    }
+
+    return p;
+  }
+
+  const { data } = await axios.get(
+    `${CFG.bybitUrl}/v5/market/tickers`,
+    {
+      params: {
+        category: 'spot',
+        symbol: CFG.symbol
+      },
+      timeout: 10000
+    }
+  );
+
+  const p = Number(data?.result?.list?.[0]?.lastPrice);
+
+  if (data?.retCode !== 0 || !Number.isFinite(p) || p <= 0) {
+    throw new Error('Bybit ticker unavailable');
+  }
+
+  return p;
+}
