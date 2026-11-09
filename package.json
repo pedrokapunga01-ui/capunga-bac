@@ -1,19 +1,27 @@
 {
-  "name": "bacbo-single-server",
-  "version": "2.0.0",
-  "private": true,
-  "description": "Bot Bac Bo completo em um único server.js para Render.",
-  "main": "server.js",
+  "name": "bacbo-signal-server",
+  "version": "4.0.0",
+  "description": "Bac Bo multi-model signal bot for Telegram (Evolution API)",
+  "main": "bacbo-server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node bacbo-server.js",
+    "dev": "node --watch bacbo-server.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=18"
   },
   "dependencies": {
     "axios": "^1.7.9",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "pg": "^8.13.1"
-  }
+  },
+  "keywords": [
+    "bacbo",
+    "telegram",
+    "signal",
+    "bot"
+  ],
+  "license": "UNLICENSED",
+  "private": true
 }
