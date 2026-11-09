@@ -2,10 +2,10 @@
   "name": "bacbo-signal-server",
   "version": "4.0.0",
   "description": "Bac Bo multi-model signal bot for Telegram (Evolution API)",
-  "main": "bacbo-server.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node bacbo-server.js",
-    "dev": "node --watch bacbo-server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "engines": {
     "node": ">=18"
@@ -16,12 +16,7 @@
     "express": "^4.21.2",
     "pg": "^8.13.1"
   },
-  "keywords": [
-    "bacbo",
-    "telegram",
-    "signal",
-    "bot"
-  ],
+  "keywords": ["bacbo", "telegram", "signal", "bot"],
   "license": "UNLICENSED",
   "private": true
 }
