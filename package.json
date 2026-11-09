@@ -1,22 +1,19 @@
 {
-  "name": "bacbo-signal-bot",
-  "version": "1.0.0",
-  "description": "Servidor Telegram de sinais Bac Bo com webhook seguro, health checks e ingestão modular de resultados.",
-  "type": "module",
-  "main": "src/server.js",
+  "name": "bacbo-single-server",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Bot Bac Bo completo em um único server.js para Render.",
+  "main": "server.js",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
-    "test": "node --test"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "axios": "^1.7.9",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "pg": "^8.13.1",
-    "telegraf": "^4.16.3"
+    "pg": "^8.13.1"
   }
 }
