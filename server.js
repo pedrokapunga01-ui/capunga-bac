@@ -97,7 +97,7 @@ async function dbInit() {
   try {
     pool = new Pool({
       connectionString: DATABASE_URL,
-      ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL) ? false : { rejectUnauthorized: true },
+      ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL) ? false : { rejectUnauthorized: false },
       max: 4
     });
     await pool.query('SELECT 1');
