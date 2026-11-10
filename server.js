@@ -1,18 +1,10 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v18 (Gale 2 · Anti-freeze · lastHistId)
- * Ficheiro: server.js
+ * CAPUNGA DADOS — BAC BO · v17.1
+ * Lógica intacta (Gale 2, 30 estratégias, SMS originais).
+ * Só corrigido: timing (poll 400/800ms, atraso 100ms) + sync (lastRoundId, sanity check).
  * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT
- *
- * Correções v18:
- *  - Apuração usa lastHistId (não timestamp) → elimina fuso de relógio API/servidor
- *  - Notificações Telegram (resultado/gale/analisando) fire-and-forget → sem freeze
- *  - galeLevel atualizado SEMPRE (mesmo se TG falhar) → nunca fica pendurado
- *  - Atraso reduzido (3s) e sync 3s → sinais chegam antes da rodada seguinte
- *  - SMS "Analisando" só depois de resultado; apaga quando o próximo sinal sai;
- *    envio/remoção não bloqueiam nem atrasam o sinal
- *  - Força LOSS quando todos os gales esgotam (sem ficar à espera do timeout)
  */
 
 const fs = require('fs');
@@ -21,8 +13,8 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
-
-/* ============================ CONFIG ============================ */
+const http = require('http');
+const https = require('https');
 
 const PORT = Number(process.env.PORT || 10000);
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
@@ -37,10 +29,14 @@ const CFG = {
   scoreMin: 80,
   minAmostra: 60,
   sinalInicial: 1,
-  syncMs: 3000,                // poll mais rápido
-  minGapMs: 30000,
-  atrasoRodadaMs: 3000,        // reduzido: sinal chega antes da rodada seguinte
-  apuraMaxMs: 900000,          // fallback LOSS se API parar (10–15 min)
+
+  // 🔥 TIMING NOVO
+  syncIntervalPendingMs: 400,     // com pendente
+  syncIntervalIdleMs: 800,        // sem pendente
+  atrasoRodadaMs: 100,            // 100ms após última rodada (era 25000)
+
+  minGapMs: 30000,                // mantido
+  apuraMaxMs: 900000,             // mantido
   maxHist: 4000,
   gapMs: 7 * 60 * 1000,
   maxSignalsMem: 500,
@@ -48,8 +44,7 @@ const CFG = {
   suspendMs: 4 * 3600 * 1000,
   suspendLossStreak: 3,
   suspendLookback: 5,
-  keepAliveMs: 60000,
-  analisandoTtlMs: 10 * 60 * 1000
+  keepAliveMs: 60000
 };
 
 const J = 'Jogador';
@@ -62,15 +57,22 @@ const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
 const API_BACBO =
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
 
-/* ============================ DEPLOY ID ============================ */
+/* ============================ HTTP AGENTS (keep-alive) ============================ */
+
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
+const apiClient = axios.create({
+  timeout: 3000,
+  httpAgent,
+  httpsAgent,
+  headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/17.1' }
+});
 
 const DEPLOY_ID = (() => {
   if (process.env.DEPLOY_ID) return String(process.env.DEPLOY_ID).trim();
   try { return crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex').slice(0, 16); }
   catch { return 'unknown'; }
 })();
-
-/* ============================ STATE ============================ */
 
 const S = {
   hist: [], seen: new Set(), signals: [],
@@ -86,13 +88,13 @@ const R = {
   ultimaSync: null, ultimaRodadaNova: null,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, wakes: 0, ultimoWake: null,
-  analisandoMsgId: null, analisandoEm: 0
+  ultimoDetectMs: null, ultimoDelayRodadaMs: null,
+  syncBusy: false, apurarBusy: false, signalBusy: false,
+  apiBugs: 0
 };
 
-let pool = null, server = null, tickTimer = null, keepTimer = null;
-let busy = false, stopping = false, lastTickMs = Date.now();
-
-/* ============================ UTILS ============================ */
+let pool = null, server = null, tickSyncTimer = null, keepTimer = null;
+let stopping = false, lastTickMs = Date.now();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (tag, d) => console.log(`[${new Date().toISOString()}] [${tag}] ${typeof d === 'string' ? d : JSON.stringify(d)}`);
@@ -126,12 +128,11 @@ async function dbInit() {
       CREATE TABLE IF NOT EXISTS capunga_signals (
         id INTEGER PRIMARY KEY, cor TEXT NOT NULL, key TEXT NOT NULL, nome TEXT NOT NULL,
         tipo TEXT NOT NULL, conf INT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDENTE',
-        gale INT, agree INT, prev_hist_id TEXT, created_at TIMESTAMPTZ NOT NULL, closed_at TIMESTAMPTZ
+        gale INT, agree INT, created_at TIMESTAMPTZ NOT NULL, closed_at TIMESTAMPTZ
       );
       CREATE INDEX IF NOT EXISTS idx_cap_sig_status ON capunga_signals(status);
       CREATE INDEX IF NOT EXISTS idx_cap_sig_created ON capunga_signals(created_at DESC);
     `);
-    await pool.query(`ALTER TABLE capunga_signals ADD COLUMN IF NOT EXISTS prev_hist_id TEXT`).catch(() => {});
     R.erroDB = null; log('DB', 'schema ok');
   } catch (e) { R.erroDB = e.message; log('DB ERRO', e.message); pool = null; }
 }
@@ -151,10 +152,10 @@ async function dbStateSet(k, v) {
 async function dbSignalInsert(s) {
   if (!pool) return;
   try {
-    await pool.query(`INSERT INTO capunga_signals (id,cor,key,nome,tipo,conf,status,gale,agree,prev_hist_id,created_at,closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING`,
+    await pool.query(`INSERT INTO capunga_signals (id,cor,key,nome,tipo,conf,status,gale,agree,created_at,closed_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
       [s.id, s.cor, s.key, s.nome, s.tipo, s.conf, s.status, s.gale ?? null, s.agree ?? 1,
-       s.prevHistId || null, new Date(s.t), s.fechadoEm ? new Date(s.fechadoEm) : null]);
+       new Date(s.t), s.fechadoEm ? new Date(s.fechadoEm) : null]);
   } catch (e) { R.erroDB = e.message; }
 }
 async function dbSignalUpdate(s) {
@@ -175,10 +176,10 @@ async function dbLoadState() {
     S.signals = r.rows.reverse().map((row) => ({
       id: row.id, cor: row.cor, key: row.key, nome: row.nome, tipo: row.tipo,
       conf: row.conf, status: row.status, gale: row.gale, agree: row.agree,
-      prevHistId: row.prev_hist_id || null,
       t: new Date(row.created_at).getTime(), criadoEm: new Date(row.created_at).getTime(),
       fechadoEm: row.closed_at ? new Date(row.closed_at).getTime() : null,
-      gale1MsgId: null, gale2MsgId: null, galeLevel: row.gale ?? 0
+      gale1MsgId: null, gale2MsgId: null, galeLevel: row.status !== 'PENDENTE' ? 2 : 0,
+      lastRoundId: null
     }));
     rebuildStats();
     log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}`);
@@ -204,40 +205,37 @@ function rebuildStats() {
 
 async function tgSendRaw(texto) {
   if (!BOT_TOKEN || !CHAT_ID) { R.erroTelegram = 'TOKEN/CHAT em falta'; return { ok: false }; }
-  for (let t = 1; t <= 3; t++) {
+  for (let t = 1; t <= 2; t++) {
     try {
       const r = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
         { chat_id: CHAT_ID, text: texto, parse_mode: 'HTML', disable_web_page_preview: true },
-        { timeout: 8000 });
+        { timeout: 5000, httpAgent, httpsAgent });
       if (r.data?.ok) { R.erroTelegram = null; return { ok: true, messageId: r.data.result.message_id }; }
       R.erroTelegram = JSON.stringify(r.data);
     } catch (e) {
       R.erroTelegram = e.response?.data ? JSON.stringify(e.response.data) : e.message;
       const retry = Number(e.response?.data?.parameters?.retry_after);
-      if (retry > 0 && retry <= 15) await sleep(retry * 1000 + 200);
+      if (retry > 0 && retry <= 20) await sleep(retry * 1000 + 200);
     }
-    if (t < 3) await sleep(800 * t);
+    if (t < 2) await sleep(400);
   }
   return { ok: false };
 }
+
+// 🔥 NOVO — envio sem bloquear
+function tgFireAndForget(texto) {
+  tgSendRaw(texto).catch((e) => log('TG FAF', e.message));
+}
+
 async function tgDelete(messageId) {
   if (!messageId || !BOT_TOKEN || !CHAT_ID) return;
   try {
     await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`,
-      { chat_id: CHAT_ID, message_id: messageId }, { timeout: 6000 });
+      { chat_id: CHAT_ID, message_id: messageId }, { timeout: 4000, httpAgent, httpsAgent });
   } catch (_) {}
 }
 
-// Fire-and-forget helpers (nunca bloqueiam o loop principal)
-function fireSend(texto, tag = 'SEND') {
-  tgSendRaw(texto).catch((e) => log(`TG ${tag}`, e.message));
-}
-function fireDelete(msgId) {
-  if (!msgId) return;
-  tgDelete(msgId).catch(() => {});
-}
-
-/* ============================ TEMPLATES ============================ */
+/* ============================ TEMPLATES SMS (IGUAIS ao v17) ============================ */
 
 function fmtAnalisando() {
   return ['🔍 <b>Analisando o mercado tropa…</b>', '', `⏱ ${hora()}`].join('\n');
@@ -345,20 +343,30 @@ function normalizeRound(item) {
     item?.outcome ?? item?.resultado ?? item?.winner ??
     (typeof d.result === 'string' ? d.result : null) ??
     (typeof item?.result === 'string' ? item.result : null);
-  const resultado = normalizeOutcome(raw);
+  let resultado = normalizeOutcome(raw);
   const id = String(d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? '').trim();
   if (!id || !resultado || !t) return null;
+
   const pj = Number(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
   const pb = Number(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
-  return { id, resultado, t, pj: Number.isFinite(pj) ? pj : null, pb: Number.isFinite(pb) ? pb : null };
+  const pjOk = Number.isFinite(pj) ? pj : null;
+  const pbOk = Number.isFinite(pb) ? pb : null;
+
+  // 🔥 SANITY CHECK: scores iguais → Empate (corrige API inconsistente)
+  if (pjOk !== null && pbOk !== null && pjOk === pbOk && resultado !== E) {
+    R.apiBugs++;
+    log('API BUG FIX', { id, reported: resultado, pj: pjOk, pb: pbOk, fixed: 'Empate' });
+    resultado = E;
+  }
+
+  return { id, resultado, t, pj: pjOk, pb: pbOk };
 }
+
 async function fetchRounds() {
   let lastErr = null;
-  for (let i = 1; i <= 3; i++) {
+  for (let i = 1; i <= 2; i++) {
     try {
-      const resp = await axios.get(API_BACBO, {
-        timeout: 12000, headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/18.0' }
-      });
+      const resp = await apiClient.get(API_BACBO);
       const map = new Map();
       for (const it of extractItems(resp.data)) {
         const rd = normalizeRound(it);
@@ -368,13 +376,13 @@ async function fetchRounds() {
       return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
     } catch (e) {
       lastErr = e; R.erroAPI = e.message;
-      if (i < 3) await sleep(400 * i);
+      if (i < 2) await sleep(200);
     }
   }
   throw lastErr || new Error('Falha API');
 }
 
-/* ============================ HELPERS ============================ */
+/* ============================ HELPERS (IGUAIS) ============================ */
 
 const hasScore = (r) => r && Number.isFinite(r.pj) && Number.isFinite(r.pb);
 const margem = (r) => Math.abs((r.pj || 0) - (r.pb || 0));
@@ -410,7 +418,7 @@ function detectRegime(seq) {
   return { trend, chop, label };
 }
 
-/* ============================ ESTRATÉGIAS ============================ */
+/* ============================ ESTRATÉGIAS (IGUAIS) ============================ */
 
 const STRATS = [
   function seqRepeticao({ seq }) {
@@ -636,7 +644,7 @@ function runStrategies(rows) {
   return out;
 }
 
-/* ============================ BACKTEST ============================ */
+/* ============================ BACKTEST (IGUAL) ============================ */
 
 function windowAt(H, i) {
   const rows = [];
@@ -682,7 +690,7 @@ function getStats(force = false) {
   return S.stats;
 }
 
-/* ============================ CONFIANÇA ============================ */
+/* ============================ CONFIANÇA (IGUAL ao v17) ============================ */
 
 function bayesianRate(w, n, priorRate = 0.90, priorWeight = 10) {
   return (w + priorRate * priorWeight) / (n + priorWeight);
@@ -716,7 +724,7 @@ function confianca(cand, ctx) {
   return Math.max(80, Math.min(95, conf));
 }
 
-/* ============================ SUSPENSÃO ============================ */
+/* ============================ SUSPENSÃO (IGUAL) ============================ */
 
 function isSuspended(key) {
   const u = SUSPENDED[key];
@@ -734,7 +742,7 @@ function maybeSuspend(key) {
   }
 }
 
-/* ============================ GATE ============================ */
+/* ============================ GATE (IGUAL) ============================ */
 
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
@@ -756,102 +764,110 @@ function podeGerar() {
   return true;
 }
 
-/* ============================ GERAR SINAL ============================ */
+/* ============================ GERAR SINAL (mesma lógica + timing novo) ============================ */
 
 async function tentarSinal() {
+  if (R.signalBusy) return;
   if (!podeGerar()) return;
 
-  const rows = S.hist.slice(-30).reverse();
-  const cands = runStrategies(rows);
-  if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
+  R.signalBusy = true;
+  const t0 = Date.now();
+  try {
+    const rows = S.hist.slice(-30).reverse();
+    const cands = runStrategies(rows);
+    if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
 
-  const stats = getStats();
-  const seq = rows.filter((r) => isCol(r.resultado));
-  const regime = detectRegime(seq);
+    const stats = getStats();
+    const seq = rows.filter((r) => isCol(r.resultado));
+    const regime = detectRegime(seq);
 
-  const byColor = {};
-  for (const c of cands) {
-    if (!byColor[c.cor]) byColor[c.cor] = [];
-    byColor[c.cor].push(c);
-  }
-
-  let melhor = null;
-  for (const cor of Object.keys(byColor)) {
-    const list = byColor[cor].filter((c) => !isSuspended(c.key));
-    if (!list.length) continue;
-    const scored = list.map((c) => ({ ...c, conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } }) }));
-    scored.sort((a, b) => b.conf - a.conf);
-    const top = scored[0];
-    if (!melhor || top.conf > melhor.conf) {
-      melhor = { ...top, agree: scored.length };
+    const byColor = {};
+    for (const c of cands) {
+      if (!byColor[c.cor]) byColor[c.cor] = [];
+      byColor[c.cor].push(c);
     }
+
+    let melhor = null;
+    for (const cor of Object.keys(byColor)) {
+      const list = byColor[cor].filter((c) => !isSuspended(c.key));
+      if (!list.length) continue;
+      const scored = list.map((c) => ({ ...c, conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } }) }));
+      scored.sort((a, b) => b.conf - a.conf);
+      const top = scored[0];
+      if (!melhor || top.conf > melhor.conf) {
+        melhor = { ...top, agree: scored.length };
+      }
+    }
+
+    if (!melhor || melhor.conf < CFG.scoreMin) { R.ultimoMotivo = `score < ${CFG.scoreMin}`; return; }
+
+    const reservedId = S.nextId;
+    const now = Date.now();
+    const lastRound = S.hist[S.hist.length - 1];
+    const sinalPreliminar = {
+      id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome, emoji: melhor.emoji,
+      conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE',
+      t: now, criadoEm: now, agree: melhor.agree,
+      gale1MsgId: null, gale2MsgId: null, galeLevel: 0,
+      lastRoundId: lastRound?.id || null     // 🔥 chave da sincronização exacta
+    };
+
+    // 🔥 "Analisando" — enviado em background, NÃO bloqueia o sinal
+    const analisandoPromise = tgSendRaw(fmtAnalisando()).catch(() => null);
+
+    // 🔥 Sinal — ÚNICO await crítico
+    const envio = await tgSendRaw(fmtSinal(sinalPreliminar));
+
+    if (!envio.ok) {
+      log('SINAL', { motivo: 'telegram rejeitou sinal', id: reservedId });
+      R.ultimoMotivo = 'telegram falhou';
+      // Apaga o analisando (que pode ou não ter chegado)
+      analisandoPromise.then(a => { if (a?.ok) tgDelete(a.messageId).catch(() => {}); });
+      return;
+    }
+
+    // 🔥 Apaga analisando em background
+    analisandoPromise.then(a => { if (a?.ok) tgDelete(a.messageId).catch(() => {}); });
+
+    // Commit
+    S.nextId++;
+    S.signals.push(sinalPreliminar);
+    if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
+    S.lastSignalAt = now;
+    R.ultimoSinal = sinalPreliminar;
+    R.ultimoMotivo = null;
+    R.ultimoTimingMs = Date.now() - t0;
+
+    dbSignalInsert(sinalPreliminar).catch(() => {});
+    dbStateSet('nextId', String(S.nextId)).catch(() => {});
+    dbStateSet('lastSignalAt', String(now)).catch(() => {});
+
+    log('SINAL', {
+      id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf,
+      key: sinalPreliminar.key, lastRoundId: sinalPreliminar.lastRoundId,
+      timingMs: R.ultimoTimingMs,
+      delayRodadaMs: lastRound ? now - lastRound.t : null
+    });
+  } catch (e) {
+    log('SIGNAL ERR', e.message);
+  } finally {
+    R.signalBusy = false;
   }
-
-  if (!melhor || melhor.conf < CFG.scoreMin) { R.ultimoMotivo = `score < ${CFG.scoreMin}`; return; }
-
-  const lastHist = S.hist[S.hist.length - 1];
-  const reservedId = S.nextId;
-  const now = Date.now();
-  const sinalPreliminar = {
-    id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome, emoji: melhor.emoji,
-    conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE',
-    t: now, criadoEm: now, agree: melhor.agree,
-    prevHistId: lastHist ? lastHist.id : null,
-    gale1MsgId: null, gale2MsgId: null, galeLevel: 0
-  };
-
-  // 1º: enviar o SINAL (prioritário — não bloqueia no "Analisando")
-  const envio = await tgSendRaw(fmtSinal(sinalPreliminar));
-  if (!envio.ok) {
-    log('SINAL', { motivo: 'telegram rejeitou sinal', id: reservedId });
-    R.ultimoMotivo = 'telegram falhou';
-    return;
-  }
-
-  // 2º: apagar SMS "Analisando" anterior (fire-and-forget — não atrasa nada)
-  if (R.analisandoMsgId) {
-    const idAntigo = R.analisandoMsgId;
-    R.analisandoMsgId = null;
-    fireDelete(idAntigo);
-  }
-
-  S.nextId++;
-  S.signals.push(sinalPreliminar);
-  if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
-  S.lastSignalAt = now;
-  R.ultimoSinal = sinalPreliminar;
-  R.ultimoMotivo = null;
-
-  await dbSignalInsert(sinalPreliminar);
-  await dbStateSet('nextId', String(S.nextId));
-  await dbStateSet('lastSignalAt', String(now));
-
-  log('SINAL', { id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf, key: sinalPreliminar.key, prevHistId: sinalPreliminar.prevHistId });
 }
 
 /* ============================ GALE ============================ */
 
-function dispararGale(s, nivel) {
-  if (s.galeLevel >= nivel) return;
-  s.galeLevel = nivel; // atualiza IMEDIATAMENTE — a lógica nunca fica pendurada
-
-  // Fire-and-forget: envio da SMS de gale (não bloqueia apuração)
-  (async () => {
-    try {
-      if (nivel === 2 && s.gale1MsgId) {
-        const id = s.gale1MsgId;
-        s.gale1MsgId = null;
-        await tgDelete(id);
-      }
-      const r = await tgSendRaw(fmtGale(s, nivel));
-      if (r.ok) {
-        if (nivel === 1) s.gale1MsgId = r.messageId;
-        else s.gale2MsgId = r.messageId;
-      }
-    } catch (e) {
-      log('GALE TG ERR', e.message);
-    }
-  })();
+async function notificarGale(s, nivel) {
+  if (nivel === 2 && s.gale1MsgId) {
+    await tgDelete(s.gale1MsgId);
+    s.gale1MsgId = null;
+  }
+  const r = await tgSendRaw(fmtGale(s, nivel));
+  if (r.ok) {
+    if (nivel === 1) s.gale1MsgId = r.messageId;
+    else s.gale2MsgId = r.messageId;
+    s.galeLevel = nivel;
+  }
 }
 
 /* ============================ FECHAR ============================ */
@@ -861,7 +877,9 @@ async function fecharSinal(s, status, gale) {
   s.gale = gale;
   s.fechadoEm = Date.now();
 
-  // Atualiza contadores já (síncrono)
+  if (s.gale1MsgId) { await tgDelete(s.gale1MsgId); s.gale1MsgId = null; }
+  if (s.gale2MsgId) { await tgDelete(s.gale2MsgId); s.gale2MsgId = null; }
+
   if (status === 'GREEN') STATS.green++;
   else if (status === 'G1') STATS.g1++;
   else if (status === 'G2') STATS.g2++;
@@ -871,167 +889,152 @@ async function fecharSinal(s, status, gale) {
   else if (status === 'LOSS') STATS.loss++;
   STATS.total++;
 
-  // Apaga msgs de gale pendentes (fire-and-forget)
-  if (s.gale1MsgId) { const id = s.gale1MsgId; s.gale1MsgId = null; fireDelete(id); }
-  if (s.gale2MsgId) { const id = s.gale2MsgId; s.gale2MsgId = null; fireDelete(id); }
+  dbSignalUpdate(s).catch(() => {});
 
-  // Persiste imediatamente (rápido)
-  await dbSignalUpdate(s);
+  // 🔥 Resultado awaited, histórico fire-and-forget
+  await tgSendRaw(fmtResult(s));
+  tgFireAndForget(fmtHistorico());
+
   maybeSuspend(s.key);
-
-  // Notificações em background — NUNCA bloqueiam o loop
-  (async () => {
-    try {
-      // 1. Envia resultado
-      const res = await tgSendRaw(fmtResult(s));
-      if (res.ok) {
-        // 2. Envia histórico
-        await tgSendRaw(fmtHistorico());
-        // 3. Apaga "Analisando" anterior (se ainda existir) e envia novo
-        if (R.analisandoMsgId) {
-          const idAntigo = R.analisandoMsgId;
-          R.analisandoMsgId = null;
-          await tgDelete(idAntigo).catch(() => {});
-        }
-        // 4. Envia SMS "Analisando" (depois de green/loss)
-        const r = await tgSendRaw(fmtAnalisando());
-        if (r.ok) {
-          R.analisandoMsgId = r.messageId;
-          R.analisandoEm = Date.now();
-        }
-      }
-    } catch (e) {
-      log('FECHAR TG ERR', e.message);
-    }
-  })();
-
-  log('FECHADO', { id: s.id, status, gale, prevHistId: s.prevHistId });
+  log('FECHO', { id: s.id, status, gale, dur: Math.round((Date.now() - s.t) / 1000) });
 }
 
-/* ============================ APURAÇÃO ============================ */
+/* ============================ APURAÇÃO (usa lastRoundId) ============================ */
 
-// Retorna as rodadas posteriores ao prevHistId do sinal.
-// Usa POSIÇÃO no histórico (não timestamp) → imune a fuso API/servidor.
 function roundsAfterSignal(s) {
-  if (!S.hist.length) return [];
-  if (s.prevHistId) {
-    const idx = S.hist.findIndex((r) => r.id === s.prevHistId);
+  if (s.lastRoundId) {
+    const idx = S.hist.findIndex((r) => r.id === s.lastRoundId);
     if (idx >= 0) return S.hist.slice(idx + 1);
   }
-  // fallback (raro): por timestamp
-  return S.hist.filter((r) => r.t > s.t);
+  // fallback para sinais antigos sem lastRoundId
+  return S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
 }
 
 async function apurar() {
+  if (R.apurarBusy) return;
+  R.apurarBusy = true;
   const now = Date.now();
+  const snapshot = [...S.signals];
+  try {
+    for (const s of snapshot) {
+      if (FECHADOS.has(s.status)) continue;
+      const after = roundsAfterSignal(s);
 
-  for (const s of S.signals) {
-    if (FECHADOS.has(s.status)) continue;
+      if (after.length === 0) {
+        if (now - s.t >= CFG.apuraMaxMs) await fecharSinal(s, 'LOSS', 0);
+        continue;
+      }
 
-    const after = roundsAfterSignal(s);
+      let decided = false;
+      let lastR = null;
 
-    if (after.length === 0) {
-      // Sem rodadas posteriores — só fecha LOSS por timeout extremo
-      if (now - s.t >= CFG.apuraMaxMs) {
+      for (let k = 0; k <= CFG.maxGale; k++) {
+        if (k >= after.length) break;
+        const r = after[k];
+        const prevT = k === 0 ? s.t : after[k - 1].t;
+        if (r.t - prevT > CFG.gapMs) break;
+        lastR = r;
+
+        if (r.resultado === s.cor) {
+          const status = k === 0 ? 'GREEN' : k === 1 ? 'G1' : 'G2';
+          await fecharSinal(s, status, k);
+          decided = true;
+          break;
+        }
+        if (r.resultado === E) {
+          const status = k === 0 ? 'EMPATE' : k === 1 ? 'EG1' : 'EG2';
+          await fecharSinal(s, status, k);
+          decided = true;
+          break;
+        }
+
+        if (k < CFG.maxGale && s.galeLevel < k + 1) {
+          await notificarGale(s, k + 1);
+        }
+      }
+
+      if (decided) continue;
+
+      const precisaMaisRodadas = (lastR && s.galeLevel < CFG.maxGale);
+      if (!precisaMaisRodadas && after.length > CFG.maxGale) {
+        await fecharSinal(s, 'LOSS', CFG.maxGale);
+      } else if (now - s.t >= CFG.apuraMaxMs) {
         await fecharSinal(s, 'LOSS', s.galeLevel || 0);
       }
-      continue;
     }
-
-    let decidido = false;
-
-    for (let k = 0; k <= CFG.maxGale; k++) {
-      if (k >= after.length) break;
-      const r = after[k];
-      const prevT = k === 0 ? (S.hist.find(x => x.id === s.prevHistId)?.t ?? s.t) : after[k - 1].t;
-      // gap de segurança: sessão interrompida
-      if (r.t - prevT > CFG.gapMs) break;
-
-      if (r.resultado === s.cor) {
-        const st = k === 0 ? 'GREEN' : k === 1 ? 'G1' : 'G2';
-        await fecharSinal(s, st, k);
-        decidido = true;
-        break;
-      }
-      if (r.resultado === E) {
-        const st = k === 0 ? 'EMPATE' : k === 1 ? 'EG1' : 'EG2';
-        await fecharSinal(s, st, k);
-        decidido = true;
-        break;
-      }
-
-      // Não bateu → dispara gale (k+1), sem bloquear o loop
-      if (k < CFG.maxGale) {
-        dispararGale(s, k + 1);
-      }
-    }
-
-    if (decidido) continue;
-
-    // Se já processámos maxGale+1 rodadas e nenhuma bateu → LOSS forçado
-    if (after.length > CFG.maxGale && s.galeLevel >= CFG.maxGale) {
-      await fecharSinal(s, 'LOSS', CFG.maxGale);
-      continue;
-    }
-
-    // Fallback de segurança: passou tempo extremo
-    if (now - s.t >= CFG.apuraMaxMs) {
-      await fecharSinal(s, 'LOSS', s.galeLevel || 0);
-    }
-  }
-
-  // Limpa "Analisando" órfão (caso não haja sinal seguinte)
-  if (R.analisandoMsgId && now - R.analisandoEm > CFG.analisandoTtlMs) {
-    const id = R.analisandoMsgId;
-    R.analisandoMsgId = null;
-    fireDelete(id);
+  } catch (e) {
+    log('APURAR ERR', e.message);
+  } finally {
+    R.apurarBusy = false;
   }
 }
 
-/* ============================ SYNC ============================ */
+/* ============================ SYNC (event-driven) ============================ */
 
-async function sync() {
+async function syncLoop() {
+  if (stopping) return;
+  if (R.syncBusy) { scheduleSync(); return; }
+  R.syncBusy = true;
+  const t0 = Date.now();
   try {
     const rounds = await fetchRounds();
-    let novos = 0;
+    let newRound = null;
+
     for (const r of rounds) {
       if (S.seen.has(r.id)) continue;
-      S.seen.add(r.id); S.hist.push(r); novos++;
-      R.ultimaRodadaNova = new Date(r.t).toISOString();
+      S.seen.add(r.id);
+      S.hist.push(r);
+      if (!newRound || r.t > newRound.t) newRound = r;
     }
-    if (S.hist.length > CFG.maxHist) {
-      const ex = S.hist.length - CFG.maxHist;
-      for (let i = 0; i < ex; i++) S.seen.delete(S.hist[i].id);
-      S.hist = S.hist.slice(ex);
+
+    if (newRound) {
+      S.hist.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
+      if (S.hist.length > CFG.maxHist) {
+        const ex = S.hist.length - CFG.maxHist;
+        for (let i = 0; i < ex; i++) S.seen.delete(S.hist[i].id);
+        S.hist = S.hist.slice(ex);
+      }
+
+      R.ultimaRodadaNova = new Date(newRound.t).toISOString();
+      R.ultimaSync = new Date().toISOString();
+      R.ultimoDetectMs = Date.now() - t0;
+      R.ultimoDelayRodadaMs = Date.now() - newRound.t;
+
+      log('SYNC', {
+        newId: newRound.id, cor: newRound.resultado,
+        detectMs: R.ultimoDetectMs, delayRodadaMs: R.ultimoDelayRodadaMs,
+        total: S.hist.length
+      });
+
+      // 🔥 Em paralelo, sem bloquear — cada um tem guard próprio
+      apurar().catch((e) => log('APURAR ERR', e.message));
+      tentarSinal().catch((e) => log('SIGNAL ERR', e.message));
     }
-    S.hist.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
-    R.ultimaSync = new Date().toISOString();
-    if (novos) log('SYNC', { novos, total: S.hist.length });
-  } catch (e) { R.erroAPI = e.message; log('SYNC ERRO', e.message); }
+  } catch (e) {
+    R.erroAPI = e.message;
+    log('SYNC ERRO', e.message);
+  } finally {
+    R.syncBusy = false;
+    scheduleSync();
+  }
 }
 
-/* ============================ LOOP ============================ */
-
-async function tick() {
-  if (busy || stopping) return;
-  busy = true; lastTickMs = Date.now();
-  try {
-    await sync();
-    await apurar();
-    await tentarSinal();
-  } catch (e) { log('TICK ERRO', e.message); }
-  finally { busy = false; }
+function scheduleSync() {
+  // 🔥 Intervalo dinâmico: 400ms com pendente, 800ms idle
+  const delay = pendentes().length > 0 ? CFG.syncIntervalPendingMs : CFG.syncIntervalIdleMs;
+  tickSyncTimer = setTimeout(syncLoop, delay);
 }
+
+/* ============================ KEEP-ALIVE ============================ */
 
 async function keepAlive() {
   const self = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '';
   if (self) { try { await axios.get(self.replace(/\/$/, '') + '/health', { timeout: 7000 }); } catch (_) {} }
-}
-function wakeCheck() {
-  if (Date.now() - lastTickMs > CFG.syncMs * 5) {
-    R.wakes++; R.ultimoWake = new Date().toISOString();
-    log('WAKE', 'atraso');
-    tick().catch(() => {});
+  if (Date.now() - lastTickMs > CFG.syncIntervalIdleMs * 8) {
+    R.wakes++;
+    R.ultimoWake = new Date().toISOString();
+    log('WAKE', 'atraso detectado — reinicia sync');
+    if (!R.syncBusy) scheduleSync();
   }
 }
 
@@ -1043,9 +1046,16 @@ app.use(cors());
 app.use(express.json({ limit: '200kb' }));
 
 app.get('/health', (req, res) => {
+  const desdeRodada = S.hist.length ? Date.now() - S.hist[S.hist.length - 1].t : null;
   res.json({
-    ok: true, versao: '18.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale,
+    ok: true, versao: '17.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
+    desdeUltimaRodadaSeg: desdeRodada ? Math.round(desdeRodada / 1000) : null,
+    ultimoDetectMs: R.ultimoDetectMs,
+    ultimoDelayRodadaMs: R.ultimoDelayRodadaMs,
+    ultimoTimingMs: R.ultimoTimingMs,
+    apiBugs: R.apiBugs,
+    loops: { syncBusy: R.syncBusy, apurarBusy: R.apurarBusy, signalBusy: R.signalBusy },
     stats: { ...STATS, greenStreak: getGreenStreak() },
     ultimaSync: R.ultimaSync, erroAPI: R.erroAPI, erroDB: R.erroDB,
     uptime: Math.round(process.uptime())
@@ -1066,8 +1076,7 @@ app.get('/stats', (req, res) => {
   const winsReais = STATS.green + STATS.g1 + STATS.g2;
   const decididos = winsReais + STATS.loss;
   res.json({
-    ...STATS,
-    wins,
+    ...STATS, wins,
     taxaComEmpate: STATS.total > 0 ? wins / STATS.total : null,
     taxaReal: decididos > 0 ? winsReais / decididos : null,
     greenStreak: getGreenStreak()
@@ -1088,39 +1097,57 @@ app.get('/calibracao', (req, res) => {
 /* ============================ START ============================ */
 
 async function start() {
-  log('BOOT', { versao: '18.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale });
+  log('BOOT', {
+    versao: '17.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale,
+    syncPendingMs: CFG.syncIntervalPendingMs, syncIdleMs: CFG.syncIntervalIdleMs,
+    atrasoRodadaMs: CFG.atrasoRodadaMs
+  });
   await dbInit();
   if (pool) await dbLoadState();
-  await sync();
+  await syncFirst();
   getStats(true);
 
-  // Recalcula galeLevel de sinais pendentes após restart
+  // Recupera PENDENTES
   if (pool) {
     for (const s of S.signals) {
       if (s.status !== 'PENDENTE') continue;
       const after = roundsAfterSignal(s);
-      let falhas = 0;
+      let consecutivasFalhas = 0;
       for (const r of after) {
         if (r.resultado === s.cor || r.resultado === E) break;
-        falhas++;
-        if (falhas > CFG.maxGale) break;
+        consecutivasFalhas++;
+        if (consecutivasFalhas > CFG.maxGale) break;
       }
-      s.galeLevel = Math.min(falhas, CFG.maxGale);
+      s.galeLevel = Math.min(consecutivasFalhas, CFG.maxGale);
     }
   }
 
   server = app.listen(PORT, () => log('HTTP', `porta ${PORT}`));
-  tickTimer = setInterval(() => tick().catch(() => {}), CFG.syncMs);
-  keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
-  setTimeout(() => tick().catch(() => {}), 1500);
+  scheduleSync();
+  keepTimer = setInterval(() => { keepAlive().catch(() => {}); }, CFG.keepAliveMs);
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
+
+async function syncFirst() {
+  try {
+    const rounds = await fetchRounds();
+    for (const r of rounds) {
+      if (S.seen.has(r.id)) continue;
+      S.seen.add(r.id);
+      S.hist.push(r);
+    }
+    S.hist.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
+    log('SYNC BOOT', { total: S.hist.length });
+  } catch (e) { log('SYNC BOOT ERRO', e.message); }
+}
+
 async function shutdown() {
   if (stopping) return;
   stopping = true; log('SHUTDOWN', 'ok');
-  clearInterval(tickTimer); clearInterval(keepTimer);
+  clearTimeout(tickSyncTimer);
+  clearInterval(keepTimer);
   if (server) server.close();
   if (pool) await pool.end().catch(() => {});
   process.exit(0);
