@@ -1,9 +1,18 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v17.5
- * Sinal imediato: poll 400ms + trigger event-driven + atrasoRodada 100ms.
+ * CAPUNGA DADOS — BAC BO · v18 (Gale 2)
+ * Ficheiro: server.js
  * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT
+ * Opcionais: IDADE_API_MAX_MS, IDADE_VISTO_MAX_MS, SELF_URL
+ *
+ * Correções v18:
+ *  - Sinal sai no mesmo ciclo em que a rodada nova é detectada (sem atraso artificial).
+ *  - Entrada = primeira rodada DEPOIS do sinal (refT). Nunca conta rodada já em curso.
+ *  - Apuração recalculada do zero a cada ciclo: não depende do Telegram, nunca congela.
+ *  - Telegram em fila com prioridade (sinal/resultado/gale primeiro). Nada bloqueia o tick.
+ *  - "Analisando a mesa": enviada após Green/Loss, apagada quando o próximo sinal sai,
+ *    com prioridade mínima (nunca impede nem atrasa o sinal).
  */
 
 const fs = require('fs');
@@ -12,8 +21,8 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
-const http = require('http');
-const https = require('https');
+
+/* ============================ CONFIG ============================ */
 
 const PORT = Number(process.env.PORT || 10000);
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
@@ -23,40 +32,26 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 
 const CFG = {
   ativos: true,
-  maxGale: 2,
-  maxPending: 3,
-  minAmostra: 40,
+  maxGale: 2,                 // Gale 2 = 3 rodadas por sinal
+  maxPending: 1,
+  scoreMin: 80,
+  minAmostra: 60,
   sinalInicial: 1,
-
-  // 🔥 Poll rápido
-  syncIntervalPendingMs: 400,    // 400ms com sinal aberto
-  syncIntervalIdleMs: 800,       // 800ms idle
-
-  // Timing
-  minGapMs: 20000,
-  atrasoRodadaMs: 100,           // 🔥 100ms (era 3000) — praticamente imediato
-  apuraMaxMs: 240000,
+  syncMs: 2000,               // polling da API
+  apiTimeoutMs: 6000,
+  cacheBust: true,
+  idadeApiMaxMs: Number(process.env.IDADE_API_MAX_MS || 20000),   // idade máx. (settledAt) da última rodada p/ emitir sinal
+  idadeVistoMaxMs: Number(process.env.IDADE_VISTO_MAX_MS || 9000), // idade máx. desde que o bot viu a rodada
+  apuraMaxMs: 10 * 60 * 1000, // sinal sem desfecho após isto expira em silêncio
   maxHist: 4000,
   gapMs: 7 * 60 * 1000,
   maxSignalsMem: 500,
   signalsOnBoot: 500,
-  suspendMs: 2 * 3600 * 1000,
-  suspendLossStreak: 4,
+  suspendMs: 4 * 3600 * 1000,
+  suspendLossStreak: 3,
   suspendLookback: 5,
   keepAliveMs: 60000,
-
-  maxPorHora: 30,
-  minPorHora: 25,
-  softUrgencyMs: 180000,
-  ultraUrgencyMs: 240000,
-  maxSemSinalMs: 270000,
-  forceClosePendingMs: 255000,
-  scoreNormal: 82,
-  scoreUrgent: 72,
-  scoreUltra: 62,
-  scoreForced: 50,
-
-  fallbackCheckMs: 3000
+  tickWatchdogMs: 45000
 };
 
 const J = 'Jogador';
@@ -68,18 +63,6 @@ const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
 
 const API_BACBO =
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
-
-/* ============================ HTTP AGENT KEEP-ALIVE ============================ */
-
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
-
-const apiClient = axios.create({
-  timeout: 3000,
-  httpAgent,
-  httpsAgent,
-  headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/17.5' }
-});
 
 /* ============================ DEPLOY ID ============================ */
 
@@ -93,29 +76,24 @@ const DEPLOY_ID = (() => {
 
 const S = {
   hist: [], seen: new Set(), signals: [],
-  nextId: CFG.sinalInicial, lastSignalAt: 0,
-  stats: null, statsAtLen: -1
+  nextId: CFG.sinalInicial, lastSignalAt: 0, lastSignalRoundId: null,
+  stats: null, statsAtLen: -1, statsRefreshing: false
 };
 
 const STATS = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, loss: 0 };
 const SUSPENDED = {};
-const ANALYSIS = { msgId: null, shownAt: 0, enviando: false };
 
 const R = {
   iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID,
   ultimaSync: null, ultimaRodadaNova: null,
   erroAPI: null, erroTelegram: null, erroDB: null,
-  ultimoMotivo: null, ultimoSinal: null,
-  wakes: 0, ultimoWake: null,
-  ultimoThreshold: null, ultimoTimingMs: null,
-  ultimoDetectMs: null,       // tempo do fetch após rodada settle
-  ultimoDelayRodadaMs: null,  // delay real entre settle e envio do sinal
-  syncBusy: false, apurarBusy: false, signalBusy: false,
-  apiBugs: 0
+  ultimoMotivo: null, ultimoSinal: null, wakes: 0, ultimoWake: null
 };
 
-let pool = null, server = null, stopping = false;
-let tickSyncTimer = null, tickFallbackTimer = null, keepTimer = null, analisandoTimer = null;
+let pool = null, server = null, tickTimer = null, keepTimer = null;
+let busy = false, busySince = 0, stopping = false, lastTickMs = Date.now();
+
+/* ============================ UTILS ============================ */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (tag, d) => console.log(`[${new Date().toISOString()}] [${tag}] ${typeof d === 'string' ? d : JSON.stringify(d)}`);
@@ -132,55 +110,6 @@ const barra = (p) => {
   return '▰'.repeat(f) + '▱'.repeat(10 - f);
 };
 const SEP = '━━━━━━━━━━━━━━━';
-
-/* ============================ FREQUÊNCIA ============================ */
-
-function sinaisUltimos60Min() {
-  const agora = Date.now();
-  return S.signals.filter((s) => s.t && agora - s.t < 3600000).length;
-}
-
-function calcularPace() {
-  const agora = Date.now();
-  const inicioHora = agora - (agora % 3600000);
-  const minutosPassados = (agora - inicioHora) / 60000;
-  if (minutosPassados < 10) return null;
-  const sinaisNestaHora = S.signals.filter((s) => s.t && s.t >= inicioHora).length;
-  const esperado = (minutosPassados / 60) * CFG.minPorHora;
-  return {
-    sinaisNestaHora, minutosPassados,
-    deficit: esperado - sinaisNestaHora,
-    pace: sinaisNestaHora / (minutosPassados / 60)
-  };
-}
-
-function calcularThreshold() {
-  const agora = Date.now();
-  const desdeUltimo = S.lastSignalAt ? agora - S.lastSignalAt : Infinity;
-  const sinaisHora = sinaisUltimos60Min();
-
-  if (sinaisHora >= CFG.maxPorHora) {
-    return { threshold: 999, forcar: false, motivo: `cap ${CFG.maxPorHora}/h` };
-  }
-
-  let threshold, forcar = false;
-  if (desdeUltimo >= CFG.maxSemSinalMs) { threshold = CFG.scoreForced; forcar = true; }
-  else if (desdeUltimo >= CFG.ultraUrgencyMs) { threshold = CFG.scoreUltra; }
-  else if (desdeUltimo >= CFG.softUrgencyMs) { threshold = CFG.scoreUrgent; }
-  else if (desdeUltimo >= 90000) { threshold = 78; }
-  else { threshold = CFG.scoreNormal; }
-
-  const pace = calcularPace();
-  if (pace && sinaisHora < 27) {
-    if (pace.deficit > 3) threshold -= 10;
-    else if (pace.deficit > 1) threshold -= 5;
-  } else if (sinaisHora >= 28) {
-    threshold += 5;
-  }
-
-  threshold = Math.max(45, Math.min(95, threshold));
-  return { threshold, forcar, motivo: `score≥${threshold} (t=${Math.round(desdeUltimo / 1000)}s)` };
-}
 
 /* ============================ DB ============================ */
 
@@ -200,6 +129,7 @@ async function dbInit() {
         tipo TEXT NOT NULL, conf INT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDENTE',
         gale INT, agree INT, created_at TIMESTAMPTZ NOT NULL, closed_at TIMESTAMPTZ
       );
+      ALTER TABLE capunga_signals ADD COLUMN IF NOT EXISTS ref_t BIGINT;
       CREATE INDEX IF NOT EXISTS idx_cap_sig_status ON capunga_signals(status);
       CREATE INDEX IF NOT EXISTS idx_cap_sig_created ON capunga_signals(created_at DESC);
     `);
@@ -222,10 +152,10 @@ async function dbStateSet(k, v) {
 async function dbSignalInsert(s) {
   if (!pool) return;
   try {
-    await pool.query(`INSERT INTO capunga_signals (id,cor,key,nome,tipo,conf,status,gale,agree,created_at,closed_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+    await pool.query(`INSERT INTO capunga_signals (id,cor,key,nome,tipo,conf,status,gale,agree,created_at,closed_at,ref_t)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING`,
       [s.id, s.cor, s.key, s.nome, s.tipo, s.conf, s.status, s.gale ?? null, s.agree ?? 1,
-       new Date(s.t), s.fechadoEm ? new Date(s.fechadoEm) : null]);
+       new Date(s.t), s.fechadoEm ? new Date(s.fechadoEm) : null, s.refT ?? null]);
   } catch (e) { R.erroDB = e.message; }
 }
 async function dbSignalUpdate(s) {
@@ -243,14 +173,16 @@ async function dbLoadState() {
     if (nextId) S.nextId = Math.max(CFG.sinalInicial, parseInt(nextId, 10));
     if (lastSignalAt) S.lastSignalAt = parseInt(lastSignalAt, 10);
     const r = await pool.query(`SELECT * FROM capunga_signals ORDER BY created_at DESC LIMIT ${CFG.signalsOnBoot}`);
-    S.signals = r.rows.reverse().map((row) => ({
-      id: row.id, cor: row.cor, key: row.key, nome: row.nome, tipo: row.tipo,
-      conf: row.conf, status: row.status, gale: row.gale, agree: row.agree,
-      t: new Date(row.created_at).getTime(), criadoEm: new Date(row.created_at).getTime(),
-      fechadoEm: row.closed_at ? new Date(row.closed_at).getTime() : null,
-      gale1MsgId: null, gale2MsgId: null, galeLevel: 0,
-      lastRoundId: null
-    }));
+    S.signals = r.rows.reverse().map((row) => {
+      const t = new Date(row.created_at).getTime();
+      return {
+        id: row.id, cor: row.cor, key: row.key, nome: row.nome, tipo: row.tipo,
+        conf: row.conf, status: row.status, gale: row.gale, agree: row.agree,
+        t, criadoEm: t, refT: row.ref_t ? Number(row.ref_t) : t,
+        fechadoEm: row.closed_at ? new Date(row.closed_at).getTime() : null,
+        enviado: true, gale1MsgId: null, gale2MsgId: null, galeLevel: 0
+      };
+    });
     rebuildStats();
     log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}`);
   } catch (e) { R.erroDB = e.message; log('DB ERRO load', e.message); }
@@ -260,91 +192,88 @@ function rebuildStats() {
   STATS.empate = 0; STATS.eg1 = 0; STATS.eg2 = 0; STATS.loss = 0;
   for (const s of S.signals) {
     if (!FECHADOS.has(s.status)) continue;
-    STATS.total++;
-    if (s.status === 'GREEN') STATS.green++;
-    else if (s.status === 'G1') STATS.g1++;
-    else if (s.status === 'G2') STATS.g2++;
-    else if (s.status === 'EMPATE') STATS.empate++;
-    else if (s.status === 'EG1') STATS.eg1++;
-    else if (s.status === 'EG2') STATS.eg2++;
-    else if (s.status === 'LOSS') STATS.loss++;
+    incStats(s.status);
   }
+}
+function incStats(status) {
+  STATS.total++;
+  if (status === 'GREEN') STATS.green++;
+  else if (status === 'G1') STATS.g1++;
+  else if (status === 'G2') STATS.g2++;
+  else if (status === 'EMPATE') STATS.empate++;
+  else if (status === 'EG1') STATS.eg1++;
+  else if (status === 'EG2') STATS.eg2++;
+  else if (status === 'LOSS') STATS.loss++;
 }
 
 /* ============================ TELEGRAM ============================ */
 
-async function tgSendRaw(texto) {
+async function tgSendRaw(texto, opt = {}) {
   if (!BOT_TOKEN || !CHAT_ID) { R.erroTelegram = 'TOKEN/CHAT em falta'; return { ok: false }; }
-  for (let t = 1; t <= 2; t++) {
+  const tries = opt.tries ?? 3;
+  const timeout = opt.timeout ?? 7000;
+  for (let t = 1; t <= tries; t++) {
     try {
       const r = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
         { chat_id: CHAT_ID, text: texto, parse_mode: 'HTML', disable_web_page_preview: true },
-        { timeout: 5000, httpAgent, httpsAgent });
+        { timeout });
       if (r.data?.ok) { R.erroTelegram = null; return { ok: true, messageId: r.data.result.message_id }; }
       R.erroTelegram = JSON.stringify(r.data);
     } catch (e) {
       R.erroTelegram = e.response?.data ? JSON.stringify(e.response.data) : e.message;
       const retry = Number(e.response?.data?.parameters?.retry_after);
-      if (retry > 0 && retry <= 20) await sleep(retry * 1000 + 200);
+      if (t < tries) {
+        if (retry > 0 && retry <= 10) await sleep(retry * 1000 + 100);
+        else await sleep(300 * t);
+        continue;
+      }
     }
-    if (t < 2) await sleep(400);
+    if (t < tries) await sleep(300 * t);
   }
   return { ok: false };
 }
-
-function tgFAF(texto) {
-  tgSendRaw(texto).catch((e) => log('TG FAF', e.message));
-}
-
 async function tgDelete(messageId) {
   if (!messageId || !BOT_TOKEN || !CHAT_ID) return;
   try {
     await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`,
-      { chat_id: CHAT_ID, message_id: messageId }, { timeout: 4000, httpAgent, httpsAgent });
+      { chat_id: CHAT_ID, message_id: messageId }, { timeout: 6000 });
   } catch (_) {}
 }
 
-/* ============================ ANALISANDO ============================ */
-
-async function ensureAnalisando() {
-  if (ANALYSIS.msgId || ANALYSIS.enviando) return;
-  ANALYSIS.enviando = true;
+/**
+ * Fila de envio com prioridade (0 = alta: sinal/resultado/gale; 1 = baixa: limpeza/analisando).
+ * Corre em segundo plano: o tick nunca espera pelo Telegram.
+ */
+const TGQ = [];
+let tgRunning = false;
+let tgSeq = 0;
+function tgEnqueue(prio, fn) {
+  return new Promise((resolve) => {
+    TGQ.push({ prio, fn, resolve, seq: ++tgSeq });
+    TGQ.sort((a, b) => a.prio - b.prio || a.seq - b.seq);
+    tgPump();
+  });
+}
+async function tgPump() {
+  if (tgRunning) return;
+  tgRunning = true;
   try {
-    const r = await tgSendRaw(fmtAnalisando());
-    if (r.ok) {
-      ANALYSIS.msgId = r.messageId;
-      ANALYSIS.shownAt = Date.now();
+    while (TGQ.length) {
+      const it = TGQ.shift();
+      try { it.resolve(await it.fn()); }
+      catch (e) { log('TG FILA ERRO', e.message); it.resolve(null); }
     }
-  } finally { ANALYSIS.enviando = false; }
+  } finally { tgRunning = false; }
 }
 
-function hideAnalisandoAsync() {
-  const id = ANALYSIS.msgId;
-  ANALYSIS.msgId = null;
-  if (id) tgDelete(id).catch(() => {});
-}
-
-function manageAnalisando() {
-  if (stopping) return;
-  const podeEscanear = CFG.ativos && pendentes().length < CFG.maxPending;
-  const desdeUltimo = S.lastSignalAt ? Date.now() - S.lastSignalAt : Infinity;
-  const precisaMostrar = podeEscanear && desdeUltimo >= CFG.minGapMs;
-
-  if (precisaMostrar) {
-    if (!ANALYSIS.msgId && !ANALYSIS.enviando) ensureAnalisando().catch(() => {});
-  } else {
-    if (ANALYSIS.msgId) hideAnalisandoAsync();
-  }
-}
-
-/* ============================ TEMPLATES ============================ */
+/* ============================ TEMPLATES SMS ============================ */
 
 function fmtAnalisando() {
-  return ['🔍 <b>Analisando o mercado tropa…</b>', '', `⏱ ${hora()}`].join('\n');
+  return ['🔍 <b>Analisando a mesa…</b>', '', `⏱ ${hora()}`].join('\n');
 }
 
 function fmtSinal(s) {
-  const confEmoji = s.conf >= 94 ? '💎' : s.conf >= 86 ? '🔥' : '⚡';
+  const confEmoji = s.conf >= 93 ? '💎' : s.conf >= 86 ? '🔥' : '⚡';
   return [
     `╔═══ 🎲 CAPUNGA · SINAL #${s.id} 🎲 ═══╗`,
     '🎯 <b>ENTRADA CONFIRMADA</b>',
@@ -388,6 +317,7 @@ function fmtHistorico() {
   const decididos = winsReais + STATS.loss;
   const taxaReal = decididos > 0 ? (winsReais / decididos) * 100 : 0;
   const streak = getGreenStreak();
+  const streakTxt = streak >= 3 ? `${streak}🔥` : `${streak}`;
   return [
     '📊 <b>HISTÓRICO</b>',
     SEP,
@@ -399,7 +329,7 @@ function fmtHistorico() {
     `🟡🟡 Empate G1: ${STATS.eg1}`,
     `🟡🟡🟡 Empate G2: ${STATS.eg2}`,
     `❌ Loss: ${STATS.loss}`,
-    `Sequência de greens: ${streak >= 3 ? streak + '🔥' : streak}`,
+    `Sequência de greens: ${streakTxt}`,
     `🎯 Taxa: ${taxa.toFixed(1)}%`,
     `💡 Taxa real (sem empate): ${taxaReal.toFixed(1)}%`
   ].join('\n');
@@ -414,6 +344,31 @@ function getGreenStreak() {
     count++;
   }
   return count;
+}
+
+/* ============================ "ANALISANDO A MESA" ============================ */
+/**
+ * - Agendada após cada Green/Loss, com prioridade mínima (nunca atrasa sinal).
+ * - Cancelada no instante em que um sinal é gerado.
+ * - A mensagem visível é apagada logo que o sinal é enviado.
+ */
+const A = { token: 0, msgId: null };
+
+function analiseAgendar() {
+  const tok = ++A.token;
+  analiseApagar(); // limpa qualquer uma anterior
+  tgEnqueue(1, async () => {
+    if (A.token !== tok) return;
+    const r = await tgSendRaw(fmtAnalisando(), { tries: 1, timeout: 3500 });
+    if (!r.ok) return;
+    if (A.token !== tok) { tgDelete(r.messageId); return; }
+    A.msgId = r.messageId;
+  });
+}
+function analiseCancelar() { A.token++; }
+function analiseApagar() {
+  const id = A.msgId; A.msgId = null;
+  if (id) tgDelete(id).catch(() => {});
 }
 
 /* ============================ API ============================ */
@@ -444,29 +399,22 @@ function normalizeRound(item) {
     item?.outcome ?? item?.resultado ?? item?.winner ??
     (typeof d.result === 'string' ? d.result : null) ??
     (typeof item?.result === 'string' ? item.result : null);
-  let resultado = normalizeOutcome(raw);
+  const resultado = normalizeOutcome(raw);
   const id = String(d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? '').trim();
   if (!id || !resultado || !t) return null;
-
   const pj = Number(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
   const pb = Number(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
-  const pjOk = Number.isFinite(pj) ? pj : null;
-  const pbOk = Number.isFinite(pb) ? pb : null;
-
-  if (pjOk !== null && pbOk !== null && pjOk === pbOk && resultado !== E) {
-    R.apiBugs++;
-    log('API BUG FIX', { id, reported: resultado, pj: pjOk, pb: pbOk, fixed: 'Empate' });
-    resultado = E;
-  }
-
-  return { id, resultado, t, pj: pjOk, pb: pbOk };
+  return { id, resultado, t, pj: Number.isFinite(pj) ? pj : null, pb: Number.isFinite(pb) ? pb : null };
 }
-
 async function fetchRounds() {
   let lastErr = null;
   for (let i = 1; i <= 2; i++) {
     try {
-      const resp = await apiClient.get(API_BACBO);
+      const url = CFG.cacheBust ? `${API_BACBO}&_=${Date.now()}` : API_BACBO;
+      const resp = await axios.get(url, {
+        timeout: CFG.apiTimeoutMs,
+        headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/18.0', 'Cache-Control': 'no-cache', Pragma: 'no-cache' }
+      });
       const map = new Map();
       for (const it of extractItems(resp.data)) {
         const rd = normalizeRound(it);
@@ -476,7 +424,7 @@ async function fetchRounds() {
       return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
     } catch (e) {
       lastErr = e; R.erroAPI = e.message;
-      if (i < 2) await sleep(200);
+      if (i < 2) await sleep(300);
     }
   }
   throw lastErr || new Error('Falha API');
@@ -521,36 +469,217 @@ function detectRegime(seq) {
 /* ============================ ESTRATÉGIAS ============================ */
 
 const STRATS = [
-  ({ seq }) => { const n = streak(seq); if (n < 3 || n > 7) return null; return { cor: seq[0].resultado, key: `SEQ_REP_${n}`, nome: `Sequência x${n}`, emoji: '🔁', strength: [0,0,0,72,78,84,86,86][n] || 86, tipo: 'seq' }; },
-  ({ seq }) => { const n = streak(seq); if (n < 4 || n > 8) return null; return { cor: opp(seq[0].resultado), key: `SEQ_QUEBRA_${n}`, nome: `Quebra x${n}`, emoji: '💥', strength: [0,0,0,0,74,80,84,85,85][n] || 85, tipo: 'seq' }; },
-  ({ seq }) => { const L = alternation(seq); if (L < 4) return null; return { cor: opp(seq[0].resultado), key: `SEQ_SURF_${L}`, nome: `Surf ${L}`, emoji: '🌊', strength: L >= 6 ? 84 : L >= 5 ? 78 : 72, tipo: 'seq' }; },
-  ({ seq }) => { if (seq.length < 4) return null; const [a,b,c,d] = seq.map(x => x.resultado); return (a === b && c === d && a !== c) ? { cor: c, key: 'SEQ_2x2', nome: 'Bloco 2+2', emoji: '♟️', strength: 76, tipo: 'seq' } : null; },
-  ({ seq }) => { if (seq.length < 4) return null; const [a,b,c,d] = seq.map(x => x.resultado); return (a !== b && b === c && c === d) ? { cor: a, key: 'SEQ_3_1', nome: '3→1 confirmado', emoji: '🧩', strength: 78, tipo: 'seq' } : null; },
-  ({ seq }) => { if (seq.length < 3 || !seq.slice(0,3).every(hasScore)) return null; const [a,b,c] = seq; if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null; const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c); return ((sb-sa===1 && sc-sb===1) || (sa-sb===1 && sb-sc===1)) ? { cor: a.resultado, key: 'NUM_ESCADA', nome: `Escada ${sa}→${sb}→${sc}`, emoji: '🪜', strength: 88, tipo: 'num' } : null; },
-  ({ seq }) => { if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null; const [a,b] = seq; return (a.resultado === b.resultado && scoreOf(a) === scoreOf(b)) ? { cor: a.resultado, key: 'NUM_REPETE', nome: `Score repetido ${scoreOf(a)}`, emoji: '🔂', strength: 84, tipo: 'num' } : null; },
-  ({ seq }) => { if (!seq.length || !hasScore(seq[0])) return null; const s = scoreOf(seq[0]); return s === 0 ? { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_0', nome: 'Gatilho 0', emoji: '🎯', strength: 86, tipo: 'num' } : null; },
-  ({ seq }) => { if (!seq.length || !hasScore(seq[0])) return null; const s = scoreOf(seq[0]); return s === 1 ? { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_1', nome: 'Gatilho 1', emoji: '🎯', strength: 84, tipo: 'num' } : null; },
-  ({ seq }) => { if (!seq.length || !hasScore(seq[0])) return null; const s = scoreOf(seq[0]); return s === 9 ? { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_9', nome: 'Gatilho 9', emoji: '🎯', strength: 88, tipo: 'num' } : null; },
-  ({ seq }) => { if (!seq.length || !hasScore(seq[0])) return null; const s = scoreOf(seq[0]); return s === 8 ? { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_8', nome: 'Gatilho 8', emoji: '🎯', strength: 78, tipo: 'num' } : null; },
-  ({ rows }) => { const r = rows[0]; if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null; return { cor: r.resultado, key: 'NUM_MARGEM5', nome: `Margem alta ${r.pj}×${r.pb}`, emoji: '📊', strength: 82, tipo: 'num' }; },
-  ({ seq }) => { if (seq.length < 3) return null; const t = seq.slice(0,3); if (!t.every(r => hasScore(r) && margem(r) >= 4 && r.resultado === t[0].resultado)) return null; return { cor: t[0].resultado, key: 'NUM_DIFF4x3', nome: 'Diff ≥4 ×3', emoji: '🔢', strength: 85, tipo: 'num' }; },
-  ({ seq }) => { if (seq.length < 2) return null; const [a,b] = seq; if (!hasScore(a) || !hasScore(b) || a.resultado !== b.resultado || scoreOf(a) > 4 || scoreOf(b) > 4) return null; return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Virada de baixos', emoji: '🔄', strength: 80, tipo: 'num' }; },
-  ({ rows }) => { const r = rows[0]; if (!r || !hasScore(r) || r.pj !== r.pb) return null; return { cor: r.resultado, key: 'NUM_ESPELHO', nome: `Espelho ${r.pj}×${r.pb}`, emoji: '🪞', strength: 83, tipo: 'num' }; },
-  ({ rows }) => { const s = rows.slice(0,8).filter(hasScore); if (s.length < 6) return null; const mj = s.reduce((a,r) => a+r.pj,0)/s.length; const mb = s.reduce((a,r) => a+r.pb,0)/s.length; const d = mj-mb; return Math.abs(d) >= 1.5 ? { cor: d > 0 ? J : B, key: 'NUM_TENDENCIA', nome: `Tendência ${mj.toFixed(1)}×${mb.toFixed(1)}`, emoji: '📈', strength: Math.abs(d) >= 2.2 ? 84 : 76, tipo: 'num' } : null; },
-  ({ seq }) => { if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null; const [a,b] = seq; const ra = scoreRange(scoreOf(a)), rb = scoreRange(scoreOf(b)); if (!ra || !rb) return null; return ((ra==='MB'&&rb==='MA') || (ra==='MA'&&rb==='MB')) ? { cor: opp(a.resultado), key: 'NUM_SALTO_RANGE', nome: `Salto ${scoreOf(b)}→${scoreOf(a)}`, emoji: '📐', strength: 81, tipo: 'num' } : null; },
-  ({ rows, seq }) => { if (!rows[0] || rows[0].resultado !== E || !seq.length) return null; return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', emoji: '🎯', strength: 74, tipo: 'num' }; },
-  ({ seq }) => { const L = alternation(seq); if (L < 4 || L > 10) return null; return { cor: opp(seq[0].resultado), key: 'SEQ_PINGPONG', nome: `Ping-pong ${L}`, emoji: '🏓', strength: 79, tipo: 'seq' }; },
-  ({ seq }) => { if (seq.length < 5) return null; const [a,b,c,d,e] = seq.map(x => x.resultado); return (a===b && b===c && c!==d && d===e) ? { cor: a, key: 'SEQ_EXTEND', nome: 'Streak extend', emoji: '⏭️', strength: 80, tipo: 'seq' } : null; },
-  ({ seq }) => { const n = streak(seq); if (n < 4 || n > 6) return null; if (!seq.slice(0,n).every(r => hasScore(r) && margem(r) >= 3)) return null; return { cor: seq[0].resultado, key: 'SEQ_STRONG_STREAK', nome: `Dragon ${n}`, emoji: '🐉', strength: 82, tipo: 'seq' }; },
-  ({ rows }) => { const r = rows[0]; if (!r || !hasScore(r)) return null; return (r.pj >= 8 && r.pb >= 8) ? { cor: r.resultado, key: 'NUM_NATURAL', nome: `Natural ${r.pj}×${r.pb}`, emoji: '🎴', strength: 86, tipo: 'num' } : null; },
-  ({ seq }) => { if (!seq.length || !hasScore(seq[0])) return null; const s = scoreOf(seq[0]); return (s === 5 || s === 8) ? { cor: seq[0].resultado, key: 'NUM_FIBONACCI', nome: `Fibonacci ${s}`, emoji: '🌀', strength: 80, tipo: 'num' } : null; },
-  ({ seq }) => { if (seq.length < 3 || !seq.slice(0,3).every(hasScore)) return null; const [a,b,c] = seq; if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null; const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c); return (sa < sb && sb < sc) ? { cor: a.resultado, key: 'NUM_SCORE_TREND_3', nome: `Escala ${sa}→${sc}`, emoji: '📊', strength: 82, tipo: 'num' } : null; },
-  ({ seq }) => { if (seq.length < 2 || !seq.slice(0,2).every(hasScore)) return null; const [a,b] = seq; if (a.resultado !== b.resultado || margem(a) < 5 || margem(b) < 5) return null; return { cor: a.resultado, key: 'NUM_DOUBLE_HIGH', nome: 'Dupla margem alta', emoji: '💪', strength: 84, tipo: 'num' }; },
-  ({ rows }) => { const ties = rows.slice(0,3).filter(r => r.resultado === E).length; if (ties < 2) return null; const pre = rows.find(r => isCol(r.resultado)); return pre ? { cor: pre.resultado, key: 'TIE_CASCADE', nome: 'Cascata empates', emoji: '🟡', strength: 76, tipo: 'num' } : null; },
-  ({ rows, seq }) => { if (!rows[0] || rows[0].resultado !== E || !rows[1] || rows[1].resultado === E || !seq.length) return null; return { cor: opp(seq[0].resultado), key: 'TIE_SINGLE', nome: 'Empate isolado', emoji: '🔀', strength: 77, tipo: 'num' }; },
-  ({ seq }) => { const s = seq.slice(0,20); if (s.length < 15) return null; const b = s.filter(r => r.resultado === B).length; const j = s.filter(r => r.resultado === J).length; if (b >= 12) return { cor: B, key: 'BANKER_BIAS_20', nome: 'Viés Banca', emoji: '📉', strength: 80, tipo: 'seq' }; if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', emoji: '📈', strength: 80, tipo: 'seq' }; return null; },
-  ({ seq }) => { if (seq.length < 4 || !seq.slice(0,4).every(hasScore)) return null; const [a,b,c,d] = seq; const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c), sd = scoreOf(d); return (sa-sb < 0 && sb-sc < 0 && sc-sd < 0) ? { cor: opp(a.resultado), key: 'MOMENTUM_SHIFT', nome: 'Mudança momentum', emoji: '🔀', strength: 78, tipo: 'num' } : null; },
-  ({ seq }) => { const L = alternation(seq); if (L < 3) return null; if (!seq.slice(0,L).every(r => hasScore(r) && margem(r) >= 3)) return null; return { cor: opp(seq[0].resultado), key: 'SEQ_ALT_STRONG', nome: `Alt. forte ${L}`, emoji: '⚔️', strength: 78, tipo: 'seq' }; }
+  function seqRepeticao({ seq }) {
+    const n = streak(seq);
+    if (n < 3 || n > 7) return null;
+    const strength = [0, 0, 0, 72, 78, 84, 86, 86][n] || 86;
+    return { cor: seq[0].resultado, key: `SEQ_REP_${n}`, nome: `Sequência x${n}`, emoji: '🔁', strength, tipo: 'seq' };
+  },
+  function seqQuebra({ seq }) {
+    const n = streak(seq);
+    if (n < 4 || n > 8) return null;
+    const strength = [0, 0, 0, 0, 74, 80, 84, 85, 85][n] || 85;
+    return { cor: opp(seq[0].resultado), key: `SEQ_QUEBRA_${n}`, nome: `Quebra x${n}`, emoji: '💥', strength, tipo: 'seq' };
+  },
+  function seqSurf({ seq }) {
+    const L = alternation(seq);
+    if (L < 4) return null;
+    const strength = L >= 6 ? 84 : L >= 5 ? 78 : 72;
+    return { cor: opp(seq[0].resultado), key: `SEQ_SURF_${L}`, nome: `Surf ${L}`, emoji: '🌊', strength, tipo: 'seq' };
+  },
+  function seqDoisDois({ seq }) {
+    if (seq.length < 4) return null;
+    const [a, b, c, d] = seq.map((x) => x.resultado);
+    if (a === b && c === d && a !== c) return { cor: c, key: 'SEQ_2x2', nome: 'Bloco 2+2', emoji: '♟️', strength: 76, tipo: 'seq' };
+    return null;
+  },
+  function seqTresUm({ seq }) {
+    if (seq.length < 4) return null;
+    const [a, b, c, d] = seq.map((x) => x.resultado);
+    if (a !== b && b === c && c === d) return { cor: a, key: 'SEQ_3_1', nome: '3→1 confirmado', emoji: '🧩', strength: 78, tipo: 'seq' };
+    return null;
+  },
+  function numEscada({ seq }) {
+    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
+    const [a, b, c] = seq;
+    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
+    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c);
+    if ((sb - sa === 1 && sc - sb === 1) || (sa - sb === 1 && sb - sc === 1)) {
+      return { cor: a.resultado, key: 'NUM_ESCADA', nome: `Escada ${sa}→${sb}→${sc}`, emoji: '🪜', strength: 88, tipo: 'num' };
+    }
+    return null;
+  },
+  function numRepeteScore({ seq }) {
+    if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
+    const [a, b] = seq;
+    if (a.resultado !== b.resultado) return null;
+    if (scoreOf(a) === scoreOf(b)) return { cor: a.resultado, key: 'NUM_REPETE', nome: `Score repetido ${scoreOf(a)}`, emoji: '🔂', strength: 84, tipo: 'num' };
+    return null;
+  },
+  function numGatilho_0({ seq }) {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 0) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_0', nome: 'Gatilho 0', emoji: '🎯', strength: 86, tipo: 'num' };
+    return null;
+  },
+  function numGatilho_1({ seq }) {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 1) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_1', nome: 'Gatilho 1', emoji: '🎯', strength: 84, tipo: 'num' };
+    return null;
+  },
+  function numGatilho_9({ seq }) {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 9) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_9', nome: 'Gatilho 9', emoji: '🎯', strength: 88, tipo: 'num' };
+    return null;
+  },
+  function numGatilho_8({ seq }) {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    if (scoreOf(seq[0]) === 8) return { cor: opp(seq[0].resultado), key: 'NUM_GATILHO_8', nome: 'Gatilho 8', emoji: '🎯', strength: 78, tipo: 'num' };
+    return null;
+  },
+  function numMargemAlta({ rows }) {
+    const r = rows[0];
+    if (!r || !isCol(r.resultado) || !hasScore(r) || margem(r) < 5) return null;
+    return { cor: r.resultado, key: 'NUM_MARGEM5', nome: `Margem alta ${r.pj}×${r.pb}`, emoji: '📊', strength: 82, tipo: 'num' };
+  },
+  function numDiff4x3({ seq }) {
+    if (seq.length < 3) return null;
+    const t = seq.slice(0, 3);
+    if (!t.every((r) => hasScore(r) && margem(r) >= 4 && r.resultado === t[0].resultado)) return null;
+    return { cor: t[0].resultado, key: 'NUM_DIFF4x3', nome: 'Diff ≥4 ×3', emoji: '🔢', strength: 85, tipo: 'num' };
+  },
+  function numViradaBaixa({ seq }) {
+    if (seq.length < 2) return null;
+    const [a, b] = seq;
+    if (!hasScore(a) || !hasScore(b) || a.resultado !== b.resultado) return null;
+    if (scoreOf(a) > 4 || scoreOf(b) > 4) return null;
+    return { cor: opp(a.resultado), key: 'NUM_VIRADA_BAIXA', nome: 'Virada de baixos', emoji: '🔄', strength: 80, tipo: 'num' };
+  },
+  function numEspelho({ rows }) {
+    const r = rows[0];
+    if (!r || !hasScore(r) || r.pj !== r.pb) return null;
+    return { cor: r.resultado, key: 'NUM_ESPELHO', nome: `Espelho ${r.pj}×${r.pb}`, emoji: '🪞', strength: 83, tipo: 'num' };
+  },
+  function numTendencia({ rows }) {
+    const s = rows.slice(0, 8).filter(hasScore);
+    if (s.length < 6) return null;
+    const mj = s.reduce((a, r) => a + r.pj, 0) / s.length;
+    const mb = s.reduce((a, r) => a + r.pb, 0) / s.length;
+    const diff = mj - mb;
+    if (Math.abs(diff) < 1.5) return null;
+    return {
+      cor: diff > 0 ? J : B, key: 'NUM_TENDENCIA',
+      nome: `Tendência ${mj.toFixed(1)}×${mb.toFixed(1)}`, emoji: '📈',
+      strength: Math.abs(diff) >= 2.2 ? 84 : 76, tipo: 'num'
+    };
+  },
+  function numRangeSalto({ seq }) {
+    if (seq.length < 2 || !hasScore(seq[0]) || !hasScore(seq[1])) return null;
+    const [a, b] = seq;
+    const ra = scoreRange(scoreOf(a)), rb = scoreRange(scoreOf(b));
+    if (!ra || !rb) return null;
+    if ((ra === 'MB' && rb === 'MA') || (ra === 'MA' && rb === 'MB')) {
+      return { cor: opp(a.resultado), key: 'NUM_SALTO_RANGE', nome: `Salto ${scoreOf(b)}→${scoreOf(a)}`, emoji: '📐', strength: 81, tipo: 'num' };
+    }
+    return null;
+  },
+  function numPosEmpate({ rows, seq }) {
+    if (!rows[0] || rows[0].resultado !== E || !seq.length) return null;
+    return { cor: seq[0].resultado, key: 'NUM_POS_EMPATE', nome: 'Pós-empate', emoji: '🎯', strength: 74, tipo: 'num' };
+  },
+  function seqPingPong({ seq }) {
+    const L = alternation(seq);
+    if (L < 4 || L > 10) return null;
+    return { cor: opp(seq[0].resultado), key: 'SEQ_PINGPONG', nome: `Ping-pong ${L}`, emoji: '🏓', strength: 79, tipo: 'seq' };
+  },
+  function seqExtend({ seq }) {
+    if (seq.length < 5) return null;
+    const [a, b, c, d, e] = seq.map((x) => x.resultado);
+    if (a === b && b === c && c !== d && d === e) {
+      return { cor: a, key: 'SEQ_EXTEND', nome: 'Streak extend', emoji: '⏭️', strength: 80, tipo: 'seq' };
+    }
+    return null;
+  },
+  function seqStrongStreak({ seq }) {
+    const n = streak(seq);
+    if (n < 4 || n > 6) return null;
+    const same = seq.slice(0, n);
+    if (!same.every((r) => hasScore(r) && margem(r) >= 3)) return null;
+    return { cor: seq[0].resultado, key: 'SEQ_STRONG_STREAK', nome: `Dragon ${n}`, emoji: '🐉', strength: 82, tipo: 'seq' };
+  },
+  function numNatural({ rows }) {
+    const r = rows[0];
+    if (!r || !hasScore(r)) return null;
+    if (r.pj >= 8 && r.pb >= 8) {
+      return { cor: r.resultado, key: 'NUM_NATURAL', nome: `Natural ${r.pj}×${r.pb}`, emoji: '🎴', strength: 86, tipo: 'num' };
+    }
+    return null;
+  },
+  function numFibonacci({ seq }) {
+    if (!seq.length || !hasScore(seq[0])) return null;
+    const s = scoreOf(seq[0]);
+    if (s === 5 || s === 8) {
+      return { cor: seq[0].resultado, key: 'NUM_FIBONACCI', nome: `Fibonacci ${s}`, emoji: '🌀', strength: 80, tipo: 'num' };
+    }
+    return null;
+  },
+  function numScoreTrend3({ seq }) {
+    if (seq.length < 3 || !seq.slice(0, 3).every(hasScore)) return null;
+    const [a, b, c] = seq;
+    if (a.resultado !== b.resultado || b.resultado !== c.resultado) return null;
+    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c);
+    if (sa < sb && sb < sc) {
+      return { cor: a.resultado, key: 'NUM_SCORE_TREND_3', nome: `Escala ascendente ${sa}→${sc}`, emoji: '📊', strength: 82, tipo: 'num' };
+    }
+    return null;
+  },
+  function numDoubleHigh({ seq }) {
+    if (seq.length < 2 || !seq.slice(0, 2).every(hasScore)) return null;
+    const [a, b] = seq;
+    if (a.resultado !== b.resultado) return null;
+    if (margem(a) >= 5 && margem(b) >= 5) {
+      return { cor: a.resultado, key: 'NUM_DOUBLE_HIGH', nome: 'Dupla margem alta', emoji: '💪', strength: 84, tipo: 'num' };
+    }
+    return null;
+  },
+  function tieCascade({ rows }) {
+    const ties = rows.slice(0, 3).filter((r) => r.resultado === E).length;
+    if (ties < 2) return null;
+    const pre = rows.find((r) => isCol(r.resultado));
+    if (!pre) return null;
+    return { cor: pre.resultado, key: 'TIE_CASCADE', nome: 'Cascata de empates', emoji: '🟡', strength: 76, tipo: 'num' };
+  },
+  function tieSingle({ rows, seq }) {
+    if (!rows[0] || rows[0].resultado !== E) return null;
+    if (!rows[1] || rows[1].resultado === E) return null;
+    if (!seq.length) return null;
+    return { cor: opp(seq[0].resultado), key: 'TIE_SINGLE', nome: 'Empate isolado', emoji: '🔀', strength: 77, tipo: 'num' };
+  },
+  function bankerBias20({ seq }) {
+    const s = seq.slice(0, 20);
+    if (s.length < 15) return null;
+    const b = s.filter((r) => r.resultado === B).length;
+    const j = s.filter((r) => r.resultado === J).length;
+    if (b >= 12) return { cor: B, key: 'BANKER_BIAS_20', nome: 'Viés Banca', emoji: '📉', strength: 80, tipo: 'seq' };
+    if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', emoji: '📈', strength: 80, tipo: 'seq' };
+    return null;
+  },
+  function numMomentumShift({ seq }) {
+    if (seq.length < 4 || !seq.slice(0, 4).every(hasScore)) return null;
+    const [a, b, c, d] = seq;
+    const sa = scoreOf(a), sb = scoreOf(b), sc = scoreOf(c), sd = scoreOf(d);
+    const m1 = sa - sb, m2 = sb - sc, m3 = sc - sd;
+    if (m1 < 0 && m2 < 0 && m3 < 0) {
+      return { cor: opp(a.resultado), key: 'MOMENTUM_SHIFT', nome: 'Mudança de momentum', emoji: '🔀', strength: 78, tipo: 'num' };
+    }
+    return null;
+  },
+  function seqAlternatingStrong({ seq }) {
+    const L = alternation(seq);
+    if (L < 3) return null;
+    const s = seq.slice(0, L);
+    if (!s.every((r) => hasScore(r) && margem(r) >= 3)) return null;
+    return { cor: opp(seq[0].resultado), key: 'SEQ_ALT_STRONG', nome: `Alt. forte ${L}`, emoji: '⚔️', strength: 78, tipo: 'seq' };
+  }
 ];
 
 function runStrategies(rows) {
@@ -583,7 +712,7 @@ function evalEntry(H, i, cor) {
   return false;
 }
 function backtest() {
-  const H = S.hist;
+  const H = S.hist.slice();
   const per = {};
   const ini = 10, fim = H.length - 1;
   if (fim - ini < 30) return { per, baseRate: 0.52 };
@@ -601,53 +730,59 @@ function backtest() {
   }
   return { per, baseRate: bn ? bw / bn : 0.52 };
 }
+/** Usa sempre o cache (nunca atrasa o sinal); recalcula em segundo plano quando velho. */
 function getStats(force = false) {
-  if (force || !S.stats || S.hist.length - S.statsAtLen >= 30) {
+  if (force || !S.stats) {
     S.stats = backtest();
     S.statsAtLen = S.hist.length;
+    return S.stats;
+  }
+  if (S.hist.length - S.statsAtLen >= 30 && !S.statsRefreshing) {
+    S.statsRefreshing = true;
+    setImmediate(() => {
+      try { S.stats = backtest(); S.statsAtLen = S.hist.length; }
+      catch (e) { log('BACKTEST ERRO', e.message); }
+      finally { S.statsRefreshing = false; }
+    });
   }
   return S.stats;
 }
 
-/* ============================ CONFIANÇA ============================ */
+/* ============================ CONFIANÇA (Gale 2) ============================ */
 
-function bayesianRate(w, n, priorRate = 0.75, priorWeight = 6) {
+function bayesianRate(w, n, priorRate = 0.90, priorWeight = 10) {
   return (w + priorRate * priorWeight) / (n + priorWeight);
-}
-function mapObservedToScore(observed) {
-  if (observed <= 0.75) return 80;
-  if (observed >= 0.93) return 95;
-  return 80 + ((observed - 0.75) / 0.18) * 15;
 }
 function confianca(cand, ctx) {
   const stats = ctx.stats;
   const p = stats.per[cand.key] || { n: 0, w: 0 };
-  const btRate = bayesianRate(p.w, p.n, 0.75, 6);
+  const baseRate = cand.cor === B ? 0.9112 : 0.9035;
+  const btRate = bayesianRate(p.w, p.n, baseRate, 10);
   const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status));
   const liveW = live.filter((x) => x.status !== 'LOSS').length;
-  const liveRate = live.length >= 3 ? bayesianRate(liveW, live.length, btRate, 3) : null;
-  const btSamples = p.n + 6;
-  const liveSamples = live.length >= 3 ? live.length + 3 : 0;
-  const observed = (btRate * btSamples + (liveRate ?? btRate) * liveSamples) / (btSamples + liveSamples);
+  const liveRate = live.length >= 3 ? bayesianRate(liveW, live.length, btRate, 4) : null;
+  const btSamples = p.n + 10;
+  const liveSamples = live.length >= 3 ? live.length + 4 : 0;
+  const observed = ((btRate * btSamples) + ((liveRate ?? btRate) * liveSamples)) / (btSamples + liveSamples);
 
-  let score = mapObservedToScore(observed);
+  let conf = Math.round(observed * 100);
+
   const agree = ctx.agreement?.confirmations || 0;
-  if (agree >= 3) score += 2;
-  else if (agree >= 2) score += 1;
-  score += (cand.strength - 80) * 0.4;
+  conf += agree >= 3 ? 2 : agree >= 2 ? 1 : 0;
+  conf += Math.round((cand.strength - 80) * 0.2);
   if (cand.tipo === 'seq' && ctx.regime) {
-    const isRev = cand.key.includes('QUEBRA') || cand.key.includes('SURF') || cand.key.includes('PINGPONG');
-    const fit = isRev ? ctx.regime.chop : ctx.regime.trend;
-    score += (fit - 0.5) * 6;
+    const regimeMatch = (cand.key.includes('QUEBRA') || cand.key.includes('SURF') || cand.key.includes('PINGPONG'))
+      ? ctx.regime.chop : ctx.regime.trend;
+    conf += Math.round((regimeMatch - 0.5) * 4);
   }
   const recentLoss = S.signals.find((x) =>
     x.key === cand.key && x.status === 'LOSS' && Date.now() - (x.fechadoEm || 0) < 5 * 60 * 1000);
-  if (recentLoss) score -= 8;
+  if (recentLoss) conf -= 3;
 
-  return Math.max(78, Math.min(96, Math.round(score)));
+  return Math.max(80, Math.min(95, conf));
 }
 
-/* ============================ SUSPENSÃO / FALLBACK / PENDENTES ============================ */
+/* ============================ SUSPENSÃO ============================ */
 
 function isSuspended(key) {
   const u = SUSPENDED[key];
@@ -664,337 +799,237 @@ function maybeSuspend(key) {
     log('SUSPENSO', { key, losses: l });
   }
 }
-function fallbackCor(rows) {
-  const seq = rows.filter((r) => isCol(r.resultado)).slice(0, 12);
-  if (!seq.length) return J;
-  const b = seq.filter((r) => r.resultado === B).length;
-  const j = seq.filter((r) => r.resultado === J).length;
-  if (b > j) return B;
-  if (j > b) return J;
-  return seq[0].resultado;
+
+/* ============================ GATE ============================ */
+
+function pendentes() { return S.signals.filter((s) => s.status === 'PENDENTE'); }
+
+function podeGerar() {
+  if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return false; }
+  if (pendentes().length >= CFG.maxPending) { R.ultimoMotivo = 'max pending'; return false; }
+  const last = S.hist[S.hist.length - 1];
+  if (!last) { R.ultimoMotivo = 'sem hist'; return false; }
+  if (S.hist.length < CFG.minAmostra) { R.ultimoMotivo = `amostra ${S.hist.length}`; return false; }
+  if (last.id === S.lastSignalRoundId) { R.ultimoMotivo = 'aguardando rodada nova'; return false; }
+
+  // Frescor: o sinal só vale se a rodada de entrada ainda estiver com apostas abertas.
+  const now = Date.now();
+  if (now - last.t > CFG.idadeApiMaxMs) { R.ultimoMotivo = `rodada velha (api ${Math.round((now - last.t) / 1000)}s)`; return false; }
+  if (now - (last.visto || 0) > CFG.idadeVistoMaxMs) { R.ultimoMotivo = `rodada velha (vista ${Math.round((now - (last.visto || 0)) / 1000)}s)`; return false; }
+  return true;
 }
-function fallbackCandidate(rows) {
-  return { cor: fallbackCor(rows), key: 'FALLBACK_TREND', nome: 'Tendência curta', emoji: '🛟', strength: 55, tipo: 'seq' };
-}
-function pendentes() {
-  return S.signals.filter((s) => !FECHADOS.has(s.status));
-}
 
-/* ============================ SYNC (event-driven, rápido) ============================ */
+/* ============================ GERAR SINAL ============================ */
 
-async function syncLoop() {
-  if (stopping) return;
-  if (R.syncBusy) { scheduleSync(); return; }
-  R.syncBusy = true;
-  const t0 = Date.now();
+async function tentarSinal() {
+  if (!podeGerar()) return;
 
-  try {
-    const rounds = await fetchRounds();
-    let newRound = null;
+  const rows = S.hist.slice(-30).reverse();
+  const cands = runStrategies(rows);
+  if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
 
-    for (const r of rounds) {
-      if (S.seen.has(r.id)) continue;
-      S.seen.add(r.id);
-      S.hist.push(r);
-      if (!newRound || r.t > newRound.t) newRound = r;
-    }
+  const stats = getStats();
+  const seq = rows.filter((r) => isCol(r.resultado));
+  const regime = detectRegime(seq);
 
-    if (newRound) {
-      // Ordena + corta
-      S.hist.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
-      if (S.hist.length > CFG.maxHist) {
-        const ex = S.hist.length - CFG.maxHist;
-        for (let i = 0; i < ex; i++) S.seen.delete(S.hist[i].id);
-        S.hist = S.hist.slice(ex);
+  const byColor = {};
+  for (const c of cands) {
+    if (!byColor[c.cor]) byColor[c.cor] = [];
+    byColor[c.cor].push(c);
+  }
+
+  let melhor = null;
+  for (const cor of Object.keys(byColor)) {
+    const list = byColor[cor].filter((c) => !isSuspended(c.key));
+    if (!list.length) continue;
+    const scored = list.map((c) => ({ ...c, conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } }) }));
+    scored.sort((a, b) => b.conf - a.conf);
+    const top = scored[0];
+    if (!melhor || top.conf > melhor.conf) melhor = { ...top, agree: scored.length };
+  }
+
+  if (!melhor || melhor.conf < CFG.scoreMin) { R.ultimoMotivo = `score < ${CFG.scoreMin}`; return; }
+
+  const last = S.hist[S.hist.length - 1];
+  const now = Date.now();
+  const sig = {
+    id: S.nextId, cor: melhor.cor, key: melhor.key, nome: melhor.nome, emoji: melhor.emoji,
+    conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE',
+    t: now, criadoEm: now, agree: melhor.agree,
+    // Entrada = primeira rodada que liquidar DEPOIS deste instante e depois da última rodada conhecida.
+    refT: Math.max(last.t, now),
+    enviado: false, gale1MsgId: null, gale2MsgId: null, galeLevel: 0
+  };
+
+  // Regista de imediato (estado em memória) e cancela o "analisando".
+  S.nextId++;
+  S.signals.push(sig);
+  if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-(CFG.maxSignalsMem - 50));
+  S.lastSignalAt = now;
+  S.lastSignalRoundId = last.id;
+  R.ultimoSinal = sig;
+  R.ultimoMotivo = null;
+  analiseCancelar();
+
+  dbSignalInsert(sig).catch(() => {});
+  dbStateSet('nextId', String(S.nextId)).catch(() => {});
+  dbStateSet('lastSignalAt', String(now)).catch(() => {});
+  log('SINAL', { id: sig.id, cor: sig.cor, conf: sig.conf, key: sig.key });
+
+  // Envio em segundo plano com prioridade máxima — não bloqueia o tick.
+  tgEnqueue(0, () => tgSendRaw(fmtSinal(sig), { tries: 3, timeout: 6000 })).then((envio) => {
+    if (envio && envio.ok) {
+      sig.enviado = true;
+      sig.sinalMsgId = envio.messageId;
+      analiseApagar(); // o "analisando" some depois do próximo SMS (o sinal)
+    } else {
+      log('SINAL', { motivo: 'telegram rejeitou sinal', id: sig.id });
+      R.ultimoMotivo = 'telegram falhou';
+      if (sig.status === 'PENDENTE') {
+        sig.status = 'EXPIRADO'; sig.fechadoEm = Date.now();
+        dbSignalUpdate(sig).catch(() => {});
       }
-
-      R.ultimaRodadaNova = new Date(newRound.t).toISOString();
-      R.ultimaSync = new Date().toISOString();
-      R.ultimoDetectMs = Date.now() - t0;
-      R.ultimoDelayRodadaMs = Date.now() - newRound.t;
-
-      log('SYNC', {
-        newId: newRound.id,
-        cor: newRound.resultado,
-        detectMs: R.ultimoDetectMs,
-        delayRodadaMs: R.ultimoDelayRodadaMs
-      });
-
-      // 🔥 Em paralelo, sem bloquear:
-      // 1. apurar (fecha sinais — síncrono + telegram FAF)
-      // 2. tentar sinal imediatamente
-      apurarOnce().catch(e => log('APURAR ERR', e.message));
-      tentarSinal().catch(e => log('SIGNAL ERR', e.message));
     }
-  } catch (e) {
-    R.erroAPI = e.message;
-    log('SYNC ERRO', e.message);
-  } finally {
-    R.syncBusy = false;
-    scheduleSync();
-  }
+  }).catch(() => {});
 }
 
-function scheduleSync() {
-  const delay = pendentes().length > 0 ? CFG.syncIntervalPendingMs : CFG.syncIntervalIdleMs;
-  tickSyncTimer = setTimeout(syncLoop, delay);
+/* ============================ GALE ============================ */
+
+function notificarGale(s, nivel) {
+  tgEnqueue(0, async () => {
+    const r = await tgSendRaw(fmtGale(s, nivel), { tries: 3, timeout: 6000 });
+    if (!r.ok) return;
+    if (nivel === 1) s.gale1MsgId = r.messageId; else s.gale2MsgId = r.messageId;
+    // Sinal já fechado enquanto a mensagem seguia: apaga logo.
+    if (s.status !== 'PENDENTE') {
+      tgDelete(r.messageId); 
+      if (nivel === 1) s.gale1MsgId = null; else s.gale2MsgId = null;
+      return;
+    }
+    // Gale 2 substitui a mensagem do Gale 1
+    if (nivel === 2 && s.gale1MsgId) { const id = s.gale1MsgId; s.gale1MsgId = null; tgDelete(id); }
+  });
 }
 
-/* ============================ APURAR (síncrono no estado, telegram FAF) ============================ */
+/* ============================ FECHAR ============================ */
 
-function roundsAfterSignal(s) {
-  if (s.lastRoundId) {
-    const idx = S.hist.findIndex((r) => r.id === s.lastRoundId);
-    if (idx >= 0) return S.hist.slice(idx + 1);
-  }
-  return S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
+function limparGales(s) {
+  tgEnqueue(1, async () => {
+    if (s.gale1MsgId) { const id = s.gale1MsgId; s.gale1MsgId = null; await tgDelete(id); }
+    if (s.gale2MsgId) { const id = s.gale2MsgId; s.gale2MsgId = null; await tgDelete(id); }
+  });
 }
 
-function markClosed(s, status, gale) {
+function fecharSinal(s, status, gale) {
+  if (s.status !== 'PENDENTE') return; // idempotente
   s.status = status;
   s.gale = gale;
   s.fechadoEm = Date.now();
-
-  if (status === 'GREEN') STATS.green++;
-  else if (status === 'G1') STATS.g1++;
-  else if (status === 'G2') STATS.g2++;
-  else if (status === 'EMPATE') STATS.empate++;
-  else if (status === 'EG1') STATS.eg1++;
-  else if (status === 'EG2') STATS.eg2++;
-  else if (status === 'LOSS') STATS.loss++;
-  STATS.total++;
+  incStats(status);
 
   dbSignalUpdate(s).catch(() => {});
+
+  // Resultado + histórico (prioridade alta, em ordem), depois limpeza e "analisando" (baixa).
+  tgEnqueue(0, () => tgSendRaw(fmtResult(s), { tries: 3, timeout: 6000 }));
+  tgEnqueue(0, () => tgSendRaw(fmtHistorico(), { tries: 2, timeout: 6000 }));
+  limparGales(s);
+  analiseAgendar();
+
   maybeSuspend(s.key);
-  log('FECHO', { id: s.id, status, gale, demorou: Math.round((Date.now() - s.t) / 1000) });
+  log('FECHADO', { id: s.id, status, gale });
 }
 
-async function sendCloseTelegram(s) {
-  if (s.gale1MsgId) { await tgDelete(s.gale1MsgId); s.gale1MsgId = null; }
-  if (s.gale2MsgId) { await tgDelete(s.gale2MsgId); s.gale2MsgId = null; }
-  await tgSendRaw(fmtResult(s));
-  tgFAF(fmtHistorico());
+function expirarSinal(s) {
+  if (s.status !== 'PENDENTE') return;
+  s.status = 'EXPIRADO';
+  s.fechadoEm = Date.now();
+  dbSignalUpdate(s).catch(() => {});
+  limparGales(s);
+  log('EXPIRADO', { id: s.id });
 }
 
-async function notificarGale(s, nivel) {
-  if (nivel === 2 && s.gale1MsgId) { await tgDelete(s.gale1MsgId); s.gale1MsgId = null; }
-  const r = await tgSendRaw(fmtGale(s, nivel));
-  if (r.ok) {
-    if (nivel === 1) s.gale1MsgId = r.messageId;
-    else s.gale2MsgId = r.messageId;
-    s.galeLevel = nivel;
+/* ============================ APURAÇÃO (determinística) ============================ */
+/**
+ * Recalculada do zero a cada ciclo só com as rodadas posteriores a s.refT.
+ * Não depende de mensagens do Telegram nem de contadores intermédios → não congela.
+ */
+function resolver(s) {
+  const after = S.hist.filter((r) => r.t > s.refT);
+  const n = Math.min(after.length, CFG.maxGale + 1);
+  for (let k = 0; k < n; k++) {
+    const r = after[k];
+    if (r.resultado === s.cor) return { fim: true, status: ['GREEN', 'G1', 'G2'][k], gale: k };
+    if (r.resultado === E) return { fim: true, status: ['EMPATE', 'EG1', 'EG2'][k], gale: k };
   }
+  if (after.length > CFG.maxGale) return { fim: true, status: 'LOSS', gale: CFG.maxGale };
+  return { fim: false, perdidas: after.length };
 }
 
-async function apurarOnce() {
-  if (R.apurarBusy) return;
-  R.apurarBusy = true;
+function apurar() {
   const now = Date.now();
-  const snapshot = [...S.signals];
-  const telegramPromises = [];
+  for (const s of S.signals) {
+    if (s.status !== 'PENDENTE' || !s.enviado) continue;
+    const res = resolver(s);
+    if (res.fim) { fecharSinal(s, res.status, res.gale); continue; }
 
+    if (res.perdidas > s.galeLevel) {
+      s.galeLevel = res.perdidas;          // marca ANTES de enviar: nunca depende do Telegram
+      notificarGale(s, res.perdidas);
+    }
+    if (now - s.t >= CFG.apuraMaxMs) expirarSinal(s);
+  }
+}
+
+/* ============================ SYNC ============================ */
+
+async function sync() {
   try {
-    for (const s of snapshot) {
-      if (FECHADOS.has(s.status)) continue;
-      const after = roundsAfterSignal(s);
-
-      if (after.length === 0) {
-        if (now - s.t >= CFG.apuraMaxMs) {
-          markClosed(s, 'LOSS', 0);
-          telegramPromises.push(sendCloseTelegram(s));
-        }
-        continue;
-      }
-
-      let decided = false;
-      let lastR = null;
-
-      for (let k = 0; k <= CFG.maxGale; k++) {
-        if (k >= after.length) break;
-        const r = after[k];
-        const prevT = k === 0 ? s.t : after[k - 1].t;
-        if (r.t - prevT > CFG.gapMs) break;
-        lastR = r;
-
-        if (r.resultado === s.cor) {
-          const status = k === 0 ? 'GREEN' : k === 1 ? 'G1' : 'G2';
-          markClosed(s, status, k);
-          telegramPromises.push(sendCloseTelegram(s));
-          decided = true;
-          break;
-        }
-        if (r.resultado === E) {
-          const status = k === 0 ? 'EMPATE' : k === 1 ? 'EG1' : 'EG2';
-          markClosed(s, status, k);
-          telegramPromises.push(sendCloseTelegram(s));
-          decided = true;
-          break;
-        }
-
-        if (k < CFG.maxGale && s.galeLevel < k + 1) {
-          telegramPromises.push(notificarGale(s, k + 1));
-        }
-      }
-
-      if (!decided) {
-        const precisaMaisRodadas = (lastR && s.galeLevel < CFG.maxGale);
-        if (!precisaMaisRodadas && after.length > CFG.maxGale) {
-          markClosed(s, 'LOSS', CFG.maxGale);
-          telegramPromises.push(sendCloseTelegram(s));
-        } else if (now - s.t >= CFG.apuraMaxMs) {
-          markClosed(s, 'LOSS', s.galeLevel || 0);
-          telegramPromises.push(sendCloseTelegram(s));
-        }
-      }
+    const rounds = await fetchRounds();
+    let novos = 0;
+    const agora = Date.now();
+    for (const r of rounds) {
+      if (S.seen.has(r.id)) continue;
+      r.visto = agora;
+      S.seen.add(r.id); S.hist.push(r); novos++;
+      R.ultimaRodadaNova = new Date(r.t).toISOString();
     }
-  } finally {
-    R.apurarBusy = false;
-  }
-
-  // 🔥 Telegram em paralelo — não bloqueia nada
-  Promise.allSettled(telegramPromises).catch(() => {});
+    if (novos) S.hist.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
+    if (S.hist.length > CFG.maxHist) {
+      const ex = S.hist.length - CFG.maxHist;
+      for (let i = 0; i < ex; i++) S.seen.delete(S.hist[i].id);
+      S.hist = S.hist.slice(ex);
+    }
+    R.ultimaSync = new Date().toISOString();
+    if (novos) log('SYNC', { novos, total: S.hist.length });
+  } catch (e) { R.erroAPI = e.message; log('SYNC ERRO', e.message); }
 }
 
-/* ============================ GERAR SINAL (rápido) ============================ */
+/* ============================ LOOP ============================ */
 
-async function tentarSinal() {
+async function tick() {
   if (stopping) return;
-  if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return; }
-  if (R.signalBusy) return;
-
-  const t0 = Date.now();
-  const thresholdInfo = calcularThreshold();
-  R.ultimoThreshold = thresholdInfo.threshold;
-  if (thresholdInfo.threshold >= 999) { R.ultimoMotivo = thresholdInfo.motivo; return; }
-
-  const agora = Date.now();
-  const desdeUltimo = S.lastSignalAt ? agora - S.lastSignalAt : Infinity;
-
-  if (desdeUltimo < CFG.minGapMs) {
-    R.ultimoMotivo = `gap ${Math.ceil((CFG.minGapMs - desdeUltimo) / 1000)}s`;
-    return;
+  if (busy) {
+    if (Date.now() - busySince < CFG.tickWatchdogMs) return;
+    log('WATCHDOG', 'tick preso, a forçar');
   }
-
-  const last = S.hist[S.hist.length - 1];
-  if (!last) { R.ultimoMotivo = 'sem hist'; return; }
-  if (agora - last.t < CFG.atrasoRodadaMs) {
-    R.ultimoMotivo = `atraso ${Math.ceil((CFG.atrasoRodadaMs - (agora - last.t)) / 1000)}s`;
-    return;
-  }
-  if (S.hist.length < CFG.minAmostra) { R.ultimoMotivo = `amostra ${S.hist.length}`; return; }
-
-  let pend = pendentes();
-  if (pend.length >= CFG.maxPending && desdeUltimo >= CFG.ultraUrgencyMs) {
-    const oldest = pend.sort((a, b) => a.t - b.t)[0];
-    if (oldest && (agora - oldest.t) > CFG.forceClosePendingMs) {
-      markClosed(oldest, 'LOSS', oldest.galeLevel || 0);
-      sendCloseTelegram(oldest).catch(() => {});
-      pend = pendentes();
-    }
-  }
-  if (pend.length >= CFG.maxPending) {
-    R.ultimoMotivo = `pendentes ${pend.length}/${CFG.maxPending}`;
-    return;
-  }
-
-  R.signalBusy = true;
+  busy = true; busySince = Date.now(); lastTickMs = busySince;
   try {
-    const rows = S.hist.slice(-30).reverse();
-    const cands = runStrategies(rows);
-    const stats = getStats();
-    const seq = rows.filter((r) => isCol(r.resultado));
-    const regime = detectRegime(seq);
-
-    const scored = [];
-    const byColor = {};
-    for (const c of cands) {
-      if (isSuspended(c.key)) continue;
-      if (!byColor[c.cor]) byColor[c.cor] = [];
-      byColor[c.cor].push(c);
-    }
-    for (const cor of Object.keys(byColor)) {
-      const list = byColor[cor];
-      for (const c of list) {
-        const conf = confianca(c, { stats, regime, agreement: { confirmations: list.length } });
-        scored.push({ ...c, conf, agree: list.length });
-      }
-    }
-    scored.sort((a, b) => b.conf - a.conf);
-
-    let melhor = scored.find((c) => c.conf >= thresholdInfo.threshold);
-    if (!melhor && thresholdInfo.forcar) {
-      melhor = scored[0] || { ...fallbackCandidate(rows), conf: CFG.scoreForced, agree: 1 };
-      melhor.isForced = true;
-    }
-    if (!melhor) { R.ultimoMotivo = `nenhum ≥${thresholdInfo.threshold}`; return; }
-
-    const analisandoId = ANALYSIS.msgId;
-    ANALYSIS.msgId = null;
-
-    const reservedId = S.nextId;
-    const now = Date.now();
-    const lastRound = S.hist[S.hist.length - 1];
-
-    const sinal = {
-      id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome, emoji: melhor.emoji,
-      conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE',
-      t: now, criadoEm: now, agree: melhor.agree,
-      gale1MsgId: null, gale2MsgId: null, galeLevel: 0,
-      lastRoundId: lastRound?.id || null
-    };
-
-    // 🔥 ÚNICA operação awaited: envio do sinal
-    const envio = await tgSendRaw(fmtSinal(sinal)).catch(() => null);
-    if (!envio?.ok) {
-      ANALYSIS.msgId = analisandoId;
-      R.ultimoMotivo = 'telegram falhou';
-      return;
-    }
-
-    // Sucesso: restantes operações em paralelo/async
-    if (analisandoId) tgDelete(analisandoId).catch(() => {});
-
-    S.nextId++;
-    S.signals.push(sinal);
-    if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
-    S.lastSignalAt = now;
-    R.ultimoSinal = sinal;
-    R.ultimoMotivo = null;
-    R.ultimoTimingMs = Date.now() - t0;
-
-    dbSignalInsert(sinal).catch(() => {});
-    dbStateSet('nextId', String(S.nextId)).catch(() => {});
-    dbStateSet('lastSignalAt', String(now)).catch(() => {});
-
-    log('SINAL', {
-      id: sinal.id, cor: sinal.cor, conf: sinal.conf, key: sinal.key,
-      lastRoundId: sinal.lastRoundId,
-      threshold: thresholdInfo.threshold, forced: !!melhor.isForced,
-      timingMs: R.ultimoTimingMs,
-      delayRodadaMs: lastRound ? now - lastRound.t : null,
-      sinaisHora: sinaisUltimos60Min()
-    });
-  } finally {
-    R.signalBusy = false;
-  }
+    await sync();
+    apurar();            // fecha sinais (estado imediato; Telegram em fila)
+    await tentarSinal(); // gera sinal na mesma passagem
+  } catch (e) { log('TICK ERRO', e.message); }
+  finally { busy = false; }
 }
-
-/* ============================ FALLBACK (só para 4:30) ============================ */
-
-function fallbackLoop() {
-  if (stopping) return;
-  const desdeUltimo = S.lastSignalAt ? Date.now() - S.lastSignalAt : Infinity;
-  if (desdeUltimo >= CFG.maxSemSinalMs && !R.signalBusy && pendentes().length < CFG.maxPending) {
-    tentarSinal().catch(e => log('SIGNAL FALLBACK', e.message));
-  }
-  tickFallbackTimer = setTimeout(fallbackLoop, CFG.fallbackCheckMs);
-}
-
-/* ============================ KEEP-ALIVE ============================ */
 
 async function keepAlive() {
   const self = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '';
   if (self) { try { await axios.get(self.replace(/\/$/, '') + '/health', { timeout: 7000 }); } catch (_) {} }
+}
+function wakeCheck() {
+  if (Date.now() - lastTickMs > CFG.syncMs * 8) {
+    R.wakes++; R.ultimoWake = new Date().toISOString();
+    log('WAKE', 'atraso'); tick().catch(() => {});
+  }
 }
 
 /* ============================ EXPRESS ============================ */
@@ -1004,61 +1039,48 @@ app.disable('x-powered-by');
 app.use(cors());
 app.use(express.json({ limit: '200kb' }));
 
+const auth = (req, res) => {
+  if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) { res.status(401).json({ erro: 'token' }); return false; }
+  return true;
+};
+
 app.get('/health', (req, res) => {
-  const pace = calcularPace();
-  const desdeUltimo = S.lastSignalAt ? Date.now() - S.lastSignalAt : null;
-  const desdeRodada = S.hist.length ? Date.now() - S.hist[S.hist.length - 1].t : null;
   res.json({
-    ok: true, versao: '17.5', deployId: DEPLOY_ID, maxGale: CFG.maxGale,
+    ok: true, versao: '18.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
-    sinaisUltimaHora: sinaisUltimos60Min(),
-    pace: pace ? { sinaisNestaHora: pace.sinaisNestaHora, minutosPassados: Math.round(pace.minutosPassados), deficit: Math.round(pace.deficit * 10) / 10 } : null,
-    desdeUltimoSinalSeg: desdeUltimo ? Math.round(desdeUltimo / 1000) : null,
-    desdeUltimaRodadaSeg: desdeRodada ? Math.round(desdeRodada / 1000) : null,
-    ultimoThreshold: R.ultimoThreshold,
-    ultimoTimingMs: R.ultimoTimingMs,
-    ultimoDetectMs: R.ultimoDetectMs,
-    ultimoDelayRodadaMs: R.ultimoDelayRodadaMs,
-    analisandoVisivel: !!ANALYSIS.msgId,
-    apiBugs: R.apiBugs,
-    loops: { syncBusy: R.syncBusy, apurarBusy: R.apurarBusy, signalBusy: R.signalBusy },
     stats: { ...STATS, greenStreak: getGreenStreak() },
-    ultimaSync: R.ultimaSync, erroAPI: R.erroAPI, erroDB: R.erroDB,
-    uptime: Math.round(process.uptime())
+    ultimaSync: R.ultimaSync, erroAPI: R.erroAPI, erroDB: R.erroDB, erroTelegram: R.erroTelegram,
+    filaTelegram: TGQ.length, uptime: Math.round(process.uptime())
   });
 });
 app.get('/status', (req, res) => {
-  if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
-  res.json({ motivo: R.ultimoMotivo, R, STATS, CFG, pace: calcularPace() });
+  if (!auth(req, res)) return;
+  res.json({ motivo: R.ultimoMotivo, R, STATS, CFG });
 });
 app.get('/sinais', (req, res) => {
-  if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
+  if (!auth(req, res)) return;
   const n = Math.min(100, Math.max(1, parseInt(req.query.n, 10) || 20));
   res.json(S.signals.slice(-n).reverse());
 });
 app.get('/stats', (req, res) => {
-  if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
+  if (!auth(req, res)) return;
   const wins = STATS.green + STATS.g1 + STATS.g2 + STATS.empate + STATS.eg1 + STATS.eg2;
   const winsReais = STATS.green + STATS.g1 + STATS.g2;
   const decididos = winsReais + STATS.loss;
   res.json({
-    ...STATS, wins,
+    ...STATS,
+    wins,
     taxaComEmpate: STATS.total > 0 ? wins / STATS.total : null,
     taxaReal: decididos > 0 ? winsReais / decididos : null,
     greenStreak: getGreenStreak()
   });
 });
 app.get('/calibracao', (req, res) => {
-  if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
-  const buckets = { '78-82': { n: 0, w: 0 }, '83-86': { n: 0, w: 0 }, '87-90': { n: 0, w: 0 }, '91-93': { n: 0, w: 0 }, '94-96': { n: 0, w: 0 } };
+  if (!auth(req, res)) return;
+  const buckets = { '80-85': { n: 0, w: 0 }, '86-92': { n: 0, w: 0 }, '93-95': { n: 0, w: 0 } };
   for (const s of S.signals) {
     if (!FECHADOS.has(s.status)) continue;
-    let b;
-    if (s.conf <= 82) b = '78-82';
-    else if (s.conf <= 86) b = '83-86';
-    else if (s.conf <= 90) b = '87-90';
-    else if (s.conf <= 93) b = '91-93';
-    else b = '94-96';
+    const b = s.conf >= 93 ? '93-95' : s.conf >= 86 ? '86-92' : '80-85';
     buckets[b].n++;
     if (s.status !== 'LOSS') buckets[b].w++;
   }
@@ -1068,69 +1090,37 @@ app.get('/calibracao', (req, res) => {
 /* ============================ START ============================ */
 
 async function start() {
-  log('BOOT', {
-    versao: '17.5', deployId: DEPLOY_ID, maxGale: CFG.maxGale,
-    syncPendingMs: CFG.syncIntervalPendingMs,
-    syncIdleMs: CFG.syncIntervalIdleMs,
-    atrasoRodadaMs: CFG.atrasoRodadaMs
-  });
-
+  log('BOOT', { versao: '18.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale });
   await dbInit();
   if (pool) await dbLoadState();
-  await syncLoopFirst();
+  await sync();
   getStats(true);
 
-  if (pool) {
-    for (const s of S.signals) {
-      if (s.status !== 'PENDENTE') continue;
-      const after = roundsAfterSignal(s);
-      let consecutivasFalhas = 0;
-      for (const r of after) {
-        if (r.resultado === s.cor || r.resultado === E) break;
-        consecutivasFalhas++;
-        if (consecutivasFalhas > CFG.maxGale) break;
-      }
-      s.galeLevel = Math.min(consecutivasFalhas, CFG.maxGale);
+  // Recuperação de pendentes após reinício: recalcula o nível de gale já consumido (sem reenviar mensagens).
+  for (const s of S.signals) {
+    if (s.status !== 'PENDENTE') continue;
+    const after = S.hist.filter((r) => r.t > s.refT);
+    let perdidas = 0;
+    for (const r of after) {
+      if (r.resultado === s.cor || r.resultado === E) break;
+      perdidas++;
+      if (perdidas > CFG.maxGale) break;
     }
+    s.galeLevel = Math.min(perdidas, CFG.maxGale);
   }
 
   server = app.listen(PORT, () => log('HTTP', `porta ${PORT}`));
-
-  // Sync loop (principal)
-  scheduleSync();
-  // Fallback (4:30 sem sinal)
-  fallbackLoop();
-  // Gestor "analisando"
-  analisandoTimer = setInterval(() => { manageAnalisando(); }, 1500);
-  // Keep-alive
-  keepTimer = setInterval(() => keepAlive().catch(() => {}), CFG.keepAliveMs);
+  tickTimer = setInterval(() => tick().catch(() => {}), CFG.syncMs);
+  keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
+  setTimeout(() => tick().catch(() => {}), 1000);
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
-
-async function syncLoopFirst() {
-  try {
-    const rounds = await fetchRounds();
-    for (const r of rounds) {
-      if (S.seen.has(r.id)) continue;
-      S.seen.add(r.id);
-      S.hist.push(r);
-    }
-    S.hist.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
-    log('SYNC BOOT', { total: S.hist.length });
-  } catch (e) {
-    log('SYNC BOOT ERRO', e.message);
-  }
-}
-
 async function shutdown() {
   if (stopping) return;
   stopping = true; log('SHUTDOWN', 'ok');
-  clearTimeout(tickSyncTimer);
-  clearTimeout(tickFallbackTimer);
-  clearInterval(analisandoTimer);
-  clearInterval(keepTimer);
+  clearInterval(tickTimer); clearInterval(keepTimer);
   if (server) server.close();
   if (pool) await pool.end().catch(() => {});
   process.exit(0);
