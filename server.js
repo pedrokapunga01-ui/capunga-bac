@@ -37,9 +37,10 @@ const CFG = {
   scoreMin: 80,
   minAmostra: 60,
   sinalInicial: 1,
-  syncMs: 2000,               // polling da API
+  syncMs: 3000,               // polling da API (2s causava 429)
   apiTimeoutMs: 6000,
-  cacheBust: true,
+  cacheBust: false,
+  backoffMaxMs: 30000,
   idadeApiMaxMs: Number(process.env.IDADE_API_MAX_MS || 20000),   // idade máx. (settledAt) da última rodada p/ emitir sinal
   idadeVistoMaxMs: Number(process.env.IDADE_VISTO_MAX_MS || 9000), // idade máx. desde que o bot viu a rodada
   apuraMaxMs: 10 * 60 * 1000, // sinal sem desfecho após isto expira em silêncio
@@ -406,6 +407,7 @@ function normalizeRound(item) {
   const pb = Number(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
   return { id, resultado, t, pj: Number.isFinite(pj) ? pj : null, pb: Number.isFinite(pb) ? pb : null };
 }
+const API_BACKOFF = { until: 0, n: 0 };
 async function fetchRounds() {
   let lastErr = null;
   for (let i = 1; i <= 2; i++) {
@@ -421,9 +423,17 @@ async function fetchRounds() {
         if (rd) map.set(rd.id, rd);
       }
       R.erroAPI = null;
+      API_BACKOFF.n = 0;
       return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
     } catch (e) {
       lastErr = e; R.erroAPI = e.message;
+      if (e.response?.status === 429) {
+        const ra = Number(e.response.headers?.['retry-after']);
+        const espera = ra > 0 ? ra * 1000 : 3000 * 2 ** API_BACKOFF.n;
+        API_BACKOFF.until = Date.now() + Math.min(CFG.backoffMaxMs, espera);
+        API_BACKOFF.n = Math.min(API_BACKOFF.n + 1, 5);
+        break; // não insiste: agrava o bloqueio
+      }
       if (i < 2) await sleep(300);
     }
   }
@@ -983,6 +993,7 @@ function apurar() {
 /* ============================ SYNC ============================ */
 
 async function sync() {
+  if (Date.now() < API_BACKOFF.until) return; // a respeitar o limite da API
   try {
     const rounds = await fetchRounds();
     let novos = 0;
@@ -1110,9 +1121,13 @@ async function start() {
   }
 
   server = app.listen(PORT, () => log('HTTP', `porta ${PORT}`));
-  tickTimer = setInterval(() => tick().catch(() => {}), CFG.syncMs);
+  const loop = async () => {
+    if (stopping) return;
+    await tick().catch(() => {});
+    tickTimer = setTimeout(loop, CFG.syncMs);
+  };
+  tickTimer = setTimeout(loop, 1500);
   keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
-  setTimeout(() => tick().catch(() => {}), 1000);
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
