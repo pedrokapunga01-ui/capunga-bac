@@ -1,21 +1,18 @@
 {
   "name": "capunga-dados-bacbo",
   "version": "17.0.0",
-  "description": "Capunga Dados — Bot de sinais Bac Bo (Evolution) com Gale 2, persistência Postgres e envio via Telegram",
-  "main": "bot.js",
+  "description": "Capunga Dados — Bot de sinais Bac Bo com Gale 2",
+  "main": "server.js",
   "type": "commonjs",
   "private": true,
   "license": "UNLICENSED",
   "author": "Capunga Dados",
   "engines": {
-    "node": ">=20.0.0",
-    "npm": ">=10.0.0"
+    "node": "20.x"
   },
   "scripts": {
-    "start": "node bot.js",
-    "dev": "node --watch bot.js",
-    "health": "curl -s http://localhost:10000/health | jq .",
-    "simular": "node simulador.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "axios": "^1.7.9",
@@ -23,12 +20,5 @@
     "express": "^4.21.2",
     "pg": "^8.13.1"
   },
-  "keywords": [
-    "bac-bo",
-    "bacbo",
-    "evolution",
-    "telegram",
-    "signals",
-    "capunga"
-  ]
+  "keywords": ["bac-bo", "bacbo", "evolution", "telegram", "signals", "capunga"]
 }
