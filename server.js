@@ -2,6 +2,7 @@
 
 /**
  * CAPUNGA DADOS — BAC BO · v17 (Gale 2)
+ * Ficheiro: server.js
  * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT
  */
 
@@ -12,6 +13,8 @@ const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
 
+/* ============================ CONFIG ============================ */
+
 const PORT = Number(process.env.PORT || 10000);
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const CHAT_ID = process.env.CHAT_ID || '';
@@ -20,7 +23,7 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 
 const CFG = {
   ativos: true,
-  maxGale: 2,               // 🔥 GALE 2 = 3 rodadas por sinal
+  maxGale: 2,               // Gale 2 = 3 rodadas por sinal
   maxPending: 1,
   scoreMin: 80,
   minAmostra: 60,
@@ -49,11 +52,15 @@ const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
 const API_BACBO =
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
 
+/* ============================ DEPLOY ID ============================ */
+
 const DEPLOY_ID = (() => {
   if (process.env.DEPLOY_ID) return String(process.env.DEPLOY_ID).trim();
   try { return crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex').slice(0, 16); }
   catch { return 'unknown'; }
 })();
+
+/* ============================ STATE ============================ */
 
 const S = {
   hist: [], seen: new Set(), signals: [],
@@ -73,6 +80,8 @@ const R = {
 
 let pool = null, server = null, tickTimer = null, keepTimer = null;
 let busy = false, stopping = false, lastTickMs = Date.now();
+
+/* ============================ UTILS ============================ */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (tag, d) => console.log(`[${new Date().toISOString()}] [${tag}] ${typeof d === 'string' ? d : JSON.stringify(d)}`);
@@ -156,7 +165,7 @@ async function dbLoadState() {
       conf: row.conf, status: row.status, gale: row.gale, agree: row.agree,
       t: new Date(row.created_at).getTime(), criadoEm: new Date(row.created_at).getTime(),
       fechadoEm: row.closed_at ? new Date(row.closed_at).getTime() : null,
-      gale1MsgId: null, gale2MsgId: null, galeLevel: row.status !== 'PENDENTE' ? 2 : 0
+      gale1MsgId: null, gale2MsgId: null, galeLevel: 0
     }));
     rebuildStats();
     log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}`);
@@ -379,7 +388,7 @@ function detectRegime(seq) {
   return { trend, chop, label };
 }
 
-/* ============================ ESTRATÉGIAS (30) ============================ */
+/* ============================ ESTRATÉGIAS ============================ */
 
 const STRATS = [
   function seqRepeticao({ seq }) {
@@ -659,9 +668,7 @@ function bayesianRate(w, n, priorRate = 0.90, priorWeight = 10) {
 function confianca(cand, ctx) {
   const stats = ctx.stats;
   const p = stats.per[cand.key] || { n: 0, w: 0 };
-  // Base Gale 2 com empate=green: ~91% banca, ~90% jogador
   const baseRate = cand.cor === B ? 0.9112 : 0.9035;
-  // Bayesiano com prior = baseRate (conservador)
   const btRate = bayesianRate(p.w, p.n, baseRate, 10);
   const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status));
   const liveW = live.filter((x) => x.status !== 'LOSS').length;
@@ -670,10 +677,8 @@ function confianca(cand, ctx) {
   const liveSamples = live.length >= 3 ? live.length + 4 : 0;
   const observed = ((btRate * btSamples) + ((liveRate ?? btRate) * liveSamples)) / (btSamples + liveSamples);
 
-  // Base em %
   let conf = Math.round(observed * 100);
 
-  // Modificadores
   const agree = ctx.agreement?.confirmations || 0;
   conf += agree >= 3 ? 2 : agree >= 2 ? 1 : 0;
   conf += Math.round((cand.strength - 80) * 0.2);
@@ -797,7 +802,6 @@ async function tentarSinal() {
 }
 
 async function notificarGale(s, nivel) {
-  // Regra: nova SMS apaga a gale anterior
   if (nivel === 2 && s.gale1MsgId) {
     await tgDelete(s.gale1MsgId);
     s.gale1MsgId = null;
@@ -817,7 +821,6 @@ async function fecharSinal(s, status, gale) {
   s.gale = gale;
   s.fechadoEm = Date.now();
 
-  // Apaga TODAS as SMS de gale pendentes antes de mandar resultado
   if (s.gale1MsgId) { await tgDelete(s.gale1MsgId); s.gale1MsgId = null; }
   if (s.gale2MsgId) { await tgDelete(s.gale2MsgId); s.gale2MsgId = null; }
 
@@ -849,7 +852,6 @@ async function apurar() {
       continue;
     }
 
-    // Verifica cada rodada até MAX_GALE
     let decided = false;
     let lastR = null;
 
@@ -873,10 +875,7 @@ async function apurar() {
         break;
       }
 
-      // Esta rodada falhou. Se ainda há gale disponível, notifica.
       if (k < CFG.maxGale) {
-        // Se é a primeira falha → notifica gale 1
-        // Se é a segunda falha → notifica gale 2
         if (s.galeLevel < k + 1) {
           await notificarGale(s, k + 1);
         }
@@ -885,10 +884,8 @@ async function apurar() {
 
     if (decided) continue;
 
-    // Se não decidiu ainda, verifica timeout
     const precisaMaisRodadas = (lastR && s.galeLevel < CFG.maxGale);
     if (!precisaMaisRodadas && after.length > CFG.maxGale) {
-      // Já vimos MAX_GALE+1 rodadas sem hit → LOSS
       await fecharSinal(s, 'LOSS', CFG.maxGale);
     } else if (now - s.t >= CFG.apuraMaxMs) {
       await fecharSinal(s, 'LOSS', s.galeLevel || 0);
@@ -917,6 +914,8 @@ async function sync() {
     if (novos) log('SYNC', { novos, total: S.hist.length });
   } catch (e) { R.erroAPI = e.message; log('SYNC ERRO', e.message); }
 }
+
+/* ============================ LOOP ============================ */
 
 async function tick() {
   if (busy || stopping) return;
@@ -996,7 +995,6 @@ async function start() {
   await sync();
   getStats(true);
 
-  // Recupera PENDENTES: re-checa se já saiu resultado
   if (pool) {
     for (const s of S.signals) {
       if (s.status !== 'PENDENTE') continue;
