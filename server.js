@@ -1,9 +1,7 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v17.1
- * Lógica intacta (Gale 2, 30 estratégias, SMS originais).
- * Só corrigido: timing (poll 400/800ms, atraso 100ms) + sync (lastRoundId, sanity check).
+ * CAPUNGA DADOS — BAC BO · v17 (Gale 2)
  * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT
  */
 
@@ -13,8 +11,6 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Pool } = require('pg');
-const http = require('http');
-const https = require('https');
 
 const PORT = Number(process.env.PORT || 10000);
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
@@ -24,19 +20,15 @@ const DATABASE_URL = process.env.DATABASE_URL || '';
 
 const CFG = {
   ativos: true,
-  maxGale: 2,
+  maxGale: 2,               // 🔥 GALE 2 = 3 rodadas por sinal
   maxPending: 1,
   scoreMin: 80,
   minAmostra: 60,
   sinalInicial: 1,
-
-  // 🔥 TIMING NOVO
-  syncIntervalPendingMs: 400,     // com pendente
-  syncIntervalIdleMs: 800,        // sem pendente
-  atrasoRodadaMs: 100,            // 100ms após última rodada (era 25000)
-
-  minGapMs: 30000,                // mantido
-  apuraMaxMs: 900000,             // mantido
+  syncMs: 3000,
+  minGapMs: 30000,
+  atrasoRodadaMs: 2000,
+  apuraMaxMs: 900000,
   maxHist: 4000,
   gapMs: 7 * 60 * 1000,
   maxSignalsMem: 500,
@@ -57,17 +49,6 @@ const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS']);
 const API_BACBO =
   'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
 
-/* ============================ HTTP AGENTS (keep-alive) ============================ */
-
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 30000 });
-const apiClient = axios.create({
-  timeout: 3000,
-  httpAgent,
-  httpsAgent,
-  headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/17.1' }
-});
-
 const DEPLOY_ID = (() => {
   if (process.env.DEPLOY_ID) return String(process.env.DEPLOY_ID).trim();
   try { return crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex').slice(0, 16); }
@@ -87,14 +68,11 @@ const R = {
   iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID,
   ultimaSync: null, ultimaRodadaNova: null,
   erroAPI: null, erroTelegram: null, erroDB: null,
-  ultimoMotivo: null, ultimoSinal: null, wakes: 0, ultimoWake: null,
-  ultimoDetectMs: null, ultimoDelayRodadaMs: null,
-  syncBusy: false, apurarBusy: false, signalBusy: false,
-  apiBugs: 0
+  ultimoMotivo: null, ultimoSinal: null, wakes: 0, ultimoWake: null
 };
 
-let pool = null, server = null, tickSyncTimer = null, keepTimer = null;
-let stopping = false, lastTickMs = Date.now();
+let pool = null, server = null, tickTimer = null, keepTimer = null;
+let busy = false, stopping = false, lastTickMs = Date.now();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (tag, d) => console.log(`[${new Date().toISOString()}] [${tag}] ${typeof d === 'string' ? d : JSON.stringify(d)}`);
@@ -119,12 +97,14 @@ async function dbInit() {
   try {
     pool = new Pool({
       connectionString: DATABASE_URL,
-      ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL) ? false : { rejectUnauthorized: false },
+      ssl: /localhost|127\.0\.0\.1/i.test(DATABASE_URL) ? false : { rejectUnauthorized: true },
       max: 4
     });
     await pool.query('SELECT 1');
     await pool.query(`
       CREATE TABLE IF NOT EXISTS capunga_state (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW());
+      CREATE TABLE IF NOT EXISTS capunga_rounds (id TEXT PRIMARY KEY, resultado TEXT NOT NULL, t BIGINT NOT NULL, pj DOUBLE PRECISION, pb DOUBLE PRECISION);
+      CREATE INDEX IF NOT EXISTS idx_cap_rounds_t ON capunga_rounds(t DESC);
       CREATE TABLE IF NOT EXISTS capunga_signals (
         id INTEGER PRIMARY KEY, cor TEXT NOT NULL, key TEXT NOT NULL, nome TEXT NOT NULL,
         tipo TEXT NOT NULL, conf INT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDENTE',
@@ -165,6 +145,15 @@ async function dbSignalUpdate(s) {
       [s.status, s.gale ?? null, s.fechadoEm ? new Date(s.fechadoEm) : null, s.id]);
   } catch (e) { R.erroDB = e.message; }
 }
+async function dbRoundUpsert(r) {
+  if (!pool) return;
+  try {
+    await pool.query(`INSERT INTO capunga_rounds(id,resultado,t,pj,pb) VALUES($1,$2,$3,$4,$5)
+      ON CONFLICT(id) DO UPDATE SET resultado=EXCLUDED.resultado,t=EXCLUDED.t,pj=EXCLUDED.pj,pb=EXCLUDED.pb`,
+      [r.id, r.resultado, r.t, r.pj, r.pb]);
+  } catch (e) { R.erroDB = e.message; }
+}
+
 async function dbLoadState() {
   if (!pool) return;
   try {
@@ -172,14 +161,16 @@ async function dbLoadState() {
     const lastSignalAt = await dbStateGet('lastSignalAt');
     if (nextId) S.nextId = Math.max(CFG.sinalInicial, parseInt(nextId, 10));
     if (lastSignalAt) S.lastSignalAt = parseInt(lastSignalAt, 10);
+    const rounds = await pool.query(`SELECT id,resultado,t,pj,pb FROM capunga_rounds ORDER BY t DESC LIMIT ${CFG.maxHist}`);
+    S.hist = rounds.rows.map((r) => ({ id: r.id, resultado: r.resultado, t: Number(r.t), pj: r.pj === null ? null : Number(r.pj), pb: r.pb === null ? null : Number(r.pb) })).reverse();
+    S.seen = new Set(S.hist.map((r) => r.id));
     const r = await pool.query(`SELECT * FROM capunga_signals ORDER BY created_at DESC LIMIT ${CFG.signalsOnBoot}`);
     S.signals = r.rows.reverse().map((row) => ({
       id: row.id, cor: row.cor, key: row.key, nome: row.nome, tipo: row.tipo,
       conf: row.conf, status: row.status, gale: row.gale, agree: row.agree,
       t: new Date(row.created_at).getTime(), criadoEm: new Date(row.created_at).getTime(),
       fechadoEm: row.closed_at ? new Date(row.closed_at).getTime() : null,
-      gale1MsgId: null, gale2MsgId: null, galeLevel: row.status !== 'PENDENTE' ? 2 : 0,
-      lastRoundId: null
+      gale1MsgId: null, gale2MsgId: null, galeLevel: row.status !== 'PENDENTE' ? 2 : 0
     }));
     rebuildStats();
     log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}`);
@@ -205,11 +196,11 @@ function rebuildStats() {
 
 async function tgSendRaw(texto) {
   if (!BOT_TOKEN || !CHAT_ID) { R.erroTelegram = 'TOKEN/CHAT em falta'; return { ok: false }; }
-  for (let t = 1; t <= 2; t++) {
+  for (let t = 1; t <= 3; t++) {
     try {
       const r = await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
         { chat_id: CHAT_ID, text: texto, parse_mode: 'HTML', disable_web_page_preview: true },
-        { timeout: 5000, httpAgent, httpsAgent });
+        { timeout: 11000 });
       if (r.data?.ok) { R.erroTelegram = null; return { ok: true, messageId: r.data.result.message_id }; }
       R.erroTelegram = JSON.stringify(r.data);
     } catch (e) {
@@ -217,25 +208,19 @@ async function tgSendRaw(texto) {
       const retry = Number(e.response?.data?.parameters?.retry_after);
       if (retry > 0 && retry <= 20) await sleep(retry * 1000 + 200);
     }
-    if (t < 2) await sleep(400);
+    if (t < 3) await sleep(1100 * t);
   }
   return { ok: false };
 }
-
-// 🔥 NOVO — envio sem bloquear
-function tgFireAndForget(texto) {
-  tgSendRaw(texto).catch((e) => log('TG FAF', e.message));
-}
-
 async function tgDelete(messageId) {
   if (!messageId || !BOT_TOKEN || !CHAT_ID) return;
   try {
     await axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`,
-      { chat_id: CHAT_ID, message_id: messageId }, { timeout: 4000, httpAgent, httpsAgent });
+      { chat_id: CHAT_ID, message_id: messageId }, { timeout: 8000 });
   } catch (_) {}
 }
 
-/* ============================ TEMPLATES SMS (IGUAIS ao v17) ============================ */
+/* ============================ TEMPLATES SMS ============================ */
 
 function fmtAnalisando() {
   return ['🔍 <b>Analisando o mercado tropa…</b>', '', `⏱ ${hora()}`].join('\n');
@@ -343,30 +328,20 @@ function normalizeRound(item) {
     item?.outcome ?? item?.resultado ?? item?.winner ??
     (typeof d.result === 'string' ? d.result : null) ??
     (typeof item?.result === 'string' ? item.result : null);
-  let resultado = normalizeOutcome(raw);
+  const resultado = normalizeOutcome(raw);
   const id = String(d.id ?? d.roundId ?? d.round_id ?? d.eventId ?? item?.id ?? item?.roundId ?? item?.round_id ?? item?.eventId ?? '').trim();
   if (!id || !resultado || !t) return null;
-
   const pj = Number(r.playerDice?.score ?? d.playerDice?.score ?? d.playerScore ?? d.player_score ?? d.pontos_jogador);
   const pb = Number(r.bankerDice?.score ?? d.bankerDice?.score ?? d.bankerScore ?? d.banker_score ?? d.pontos_banca);
-  const pjOk = Number.isFinite(pj) ? pj : null;
-  const pbOk = Number.isFinite(pb) ? pb : null;
-
-  // 🔥 SANITY CHECK: scores iguais → Empate (corrige API inconsistente)
-  if (pjOk !== null && pbOk !== null && pjOk === pbOk && resultado !== E) {
-    R.apiBugs++;
-    log('API BUG FIX', { id, reported: resultado, pj: pjOk, pb: pbOk, fixed: 'Empate' });
-    resultado = E;
-  }
-
-  return { id, resultado, t, pj: pjOk, pb: pbOk };
+  return { id, resultado, t, pj: Number.isFinite(pj) ? pj : null, pb: Number.isFinite(pb) ? pb : null };
 }
-
 async function fetchRounds() {
   let lastErr = null;
   for (let i = 1; i <= 2; i++) {
     try {
-      const resp = await apiClient.get(API_BACBO);
+      const resp = await axios.get(API_BACBO, {
+        timeout: 10000, headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/17.0' }
+      });
       const map = new Map();
       for (const it of extractItems(resp.data)) {
         const rd = normalizeRound(it);
@@ -376,13 +351,13 @@ async function fetchRounds() {
       return [...map.values()].sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
     } catch (e) {
       lastErr = e; R.erroAPI = e.message;
-      if (i < 2) await sleep(200);
+      if (i < 2) await sleep(500);
     }
   }
   throw lastErr || new Error('Falha API');
 }
 
-/* ============================ HELPERS (IGUAIS) ============================ */
+/* ============================ HELPERS ============================ */
 
 const hasScore = (r) => r && Number.isFinite(r.pj) && Number.isFinite(r.pb);
 const margem = (r) => Math.abs((r.pj || 0) - (r.pb || 0));
@@ -418,7 +393,7 @@ function detectRegime(seq) {
   return { trend, chop, label };
 }
 
-/* ============================ ESTRATÉGIAS (IGUAIS) ============================ */
+/* ============================ ESTRATÉGIAS (30) ============================ */
 
 const STRATS = [
   function seqRepeticao({ seq }) {
@@ -644,7 +619,7 @@ function runStrategies(rows) {
   return out;
 }
 
-/* ============================ BACKTEST (IGUAL) ============================ */
+/* ============================ BACKTEST ============================ */
 
 function windowAt(H, i) {
   const rows = [];
@@ -690,7 +665,7 @@ function getStats(force = false) {
   return S.stats;
 }
 
-/* ============================ CONFIANÇA (IGUAL ao v17) ============================ */
+/* ============================ CONFIANÇA (Gale 2) ============================ */
 
 function bayesianRate(w, n, priorRate = 0.90, priorWeight = 10) {
   return (w + priorRate * priorWeight) / (n + priorWeight);
@@ -698,7 +673,9 @@ function bayesianRate(w, n, priorRate = 0.90, priorWeight = 10) {
 function confianca(cand, ctx) {
   const stats = ctx.stats;
   const p = stats.per[cand.key] || { n: 0, w: 0 };
+  // Base Gale 2 com empate=green: ~91% banca, ~90% jogador
   const baseRate = cand.cor === B ? 0.9112 : 0.9035;
+  // Bayesiano com prior = baseRate (conservador)
   const btRate = bayesianRate(p.w, p.n, baseRate, 10);
   const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status));
   const liveW = live.filter((x) => x.status !== 'LOSS').length;
@@ -707,8 +684,10 @@ function confianca(cand, ctx) {
   const liveSamples = live.length >= 3 ? live.length + 4 : 0;
   const observed = ((btRate * btSamples) + ((liveRate ?? btRate) * liveSamples)) / (btSamples + liveSamples);
 
+  // Base em %
   let conf = Math.round(observed * 100);
 
+  // Modificadores
   const agree = ctx.agreement?.confirmations || 0;
   conf += agree >= 3 ? 2 : agree >= 2 ? 1 : 0;
   conf += Math.round((cand.strength - 80) * 0.2);
@@ -724,7 +703,7 @@ function confianca(cand, ctx) {
   return Math.max(80, Math.min(95, conf));
 }
 
-/* ============================ SUSPENSÃO (IGUAL) ============================ */
+/* ============================ SUSPENSÃO ============================ */
 
 function isSuspended(key) {
   const u = SUSPENDED[key];
@@ -733,16 +712,15 @@ function isSuspended(key) {
   return true;
 }
 function maybeSuspend(key) {
-  const recent = S.signals.filter((x) => x.key === key && FECHADOS.has(x.status)).slice(-CFG.suspendLookback);
-  if (recent.length < CFG.suspendLookback - 1) return;
-  const l = recent.filter((x) => x.status === 'LOSS').length;
-  if (l >= CFG.suspendLossStreak) {
+  const recent = S.signals.filter((x) => x.key === key && FECHADOS.has(x.status)).slice(-CFG.suspendLossStreak);
+  if (recent.length < CFG.suspendLossStreak) return;
+  if (recent.every((x) => x.status === 'LOSS')) {
     SUSPENDED[key] = Date.now() + CFG.suspendMs;
-    log('SUSPENSO', { key, losses: l });
+    log('SUSPENSO', { key, consecutiveLosses: recent.length });
   }
 }
 
-/* ============================ GATE (IGUAL) ============================ */
+/* ============================ GATE ============================ */
 
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
@@ -764,100 +742,77 @@ function podeGerar() {
   return true;
 }
 
-/* ============================ GERAR SINAL (mesma lógica + timing novo) ============================ */
+/* ============================ GERAR SINAL ============================ */
 
 async function tentarSinal() {
-  if (R.signalBusy) return;
   if (!podeGerar()) return;
 
-  R.signalBusy = true;
-  const t0 = Date.now();
+  const rows = S.hist.slice(-30).reverse();
+  const cands = runStrategies(rows);
+  if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
+
+  const stats = getStats();
+  const seq = rows.filter((r) => isCol(r.resultado));
+  const regime = detectRegime(seq);
+
+  const byColor = {};
+  for (const c of cands) {
+    if (!byColor[c.cor]) byColor[c.cor] = [];
+    byColor[c.cor].push(c);
+  }
+
+  let melhor = null;
+  for (const cor of Object.keys(byColor)) {
+    const list = byColor[cor].filter((c) => !isSuspended(c.key));
+    if (!list.length) continue;
+    const scored = list.map((c) => ({ ...c, conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } }) }));
+    scored.sort((a, b) => b.conf - a.conf);
+    const top = scored[0];
+    if (!melhor || top.conf > melhor.conf) {
+      melhor = { ...top, agree: scored.length };
+    }
+  }
+
+  if (!melhor || melhor.conf < CFG.scoreMin) { R.ultimoMotivo = `score < ${CFG.scoreMin}`; return; }
+
+  const reservedId = S.nextId;
+  const now = Date.now();
+  const sinalPreliminar = {
+    id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome, emoji: melhor.emoji,
+    conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE',
+    t: now, criadoEm: now, agree: melhor.agree,
+    gale1MsgId: null, gale2MsgId: null, galeLevel: 0
+  };
+
+  const analisando = await tgSendRaw(fmtAnalisando());
   try {
-    const rows = S.hist.slice(-30).reverse();
-    const cands = runStrategies(rows);
-    if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
-
-    const stats = getStats();
-    const seq = rows.filter((r) => isCol(r.resultado));
-    const regime = detectRegime(seq);
-
-    const byColor = {};
-    for (const c of cands) {
-      if (!byColor[c.cor]) byColor[c.cor] = [];
-      byColor[c.cor].push(c);
-    }
-
-    let melhor = null;
-    for (const cor of Object.keys(byColor)) {
-      const list = byColor[cor].filter((c) => !isSuspended(c.key));
-      if (!list.length) continue;
-      const scored = list.map((c) => ({ ...c, conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } }) }));
-      scored.sort((a, b) => b.conf - a.conf);
-      const top = scored[0];
-      if (!melhor || top.conf > melhor.conf) {
-        melhor = { ...top, agree: scored.length };
-      }
-    }
-
-    if (!melhor || melhor.conf < CFG.scoreMin) { R.ultimoMotivo = `score < ${CFG.scoreMin}`; return; }
-
-    const reservedId = S.nextId;
-    const now = Date.now();
-    const lastRound = S.hist[S.hist.length - 1];
-    const sinalPreliminar = {
-      id: reservedId, cor: melhor.cor, key: melhor.key, nome: melhor.nome, emoji: melhor.emoji,
-      conf: melhor.conf, tipo: melhor.tipo, status: 'PENDENTE',
-      t: now, criadoEm: now, agree: melhor.agree,
-      gale1MsgId: null, gale2MsgId: null, galeLevel: 0,
-      lastRoundId: lastRound?.id || null     // 🔥 chave da sincronização exacta
-    };
-
-    // 🔥 "Analisando" — enviado em background, NÃO bloqueia o sinal
-    const analisandoPromise = tgSendRaw(fmtAnalisando()).catch(() => null);
-
-    // 🔥 Sinal — ÚNICO await crítico
     const envio = await tgSendRaw(fmtSinal(sinalPreliminar));
-
     if (!envio.ok) {
       log('SINAL', { motivo: 'telegram rejeitou sinal', id: reservedId });
       R.ultimoMotivo = 'telegram falhou';
-      // Apaga o analisando (que pode ou não ter chegado)
-      analisandoPromise.then(a => { if (a?.ok) tgDelete(a.messageId).catch(() => {}); });
       return;
     }
-
-    // 🔥 Apaga analisando em background
-    analisandoPromise.then(a => { if (a?.ok) tgDelete(a.messageId).catch(() => {}); });
-
-    // Commit
+    sinalPreliminar.t = Date.now();
+    sinalPreliminar.criadoEm = sinalPreliminar.t;
     S.nextId++;
     S.signals.push(sinalPreliminar);
     if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
     S.lastSignalAt = now;
     R.ultimoSinal = sinalPreliminar;
     R.ultimoMotivo = null;
-    R.ultimoTimingMs = Date.now() - t0;
 
-    dbSignalInsert(sinalPreliminar).catch(() => {});
-    dbStateSet('nextId', String(S.nextId)).catch(() => {});
-    dbStateSet('lastSignalAt', String(now)).catch(() => {});
+    await dbSignalInsert(sinalPreliminar);
+    await dbStateSet('nextId', String(S.nextId));
+    await dbStateSet('lastSignalAt', String(now));
 
-    log('SINAL', {
-      id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf,
-      key: sinalPreliminar.key, lastRoundId: sinalPreliminar.lastRoundId,
-      timingMs: R.ultimoTimingMs,
-      delayRodadaMs: lastRound ? now - lastRound.t : null
-    });
-  } catch (e) {
-    log('SIGNAL ERR', e.message);
+    log('SINAL', { id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf, key: sinalPreliminar.key });
   } finally {
-    R.signalBusy = false;
+    if (analisando.ok) await tgDelete(analisando.messageId);
   }
 }
 
-/* ============================ GALE ============================ */
-
 async function notificarGale(s, nivel) {
+  // Regra: nova SMS apaga a gale anterior
   if (nivel === 2 && s.gale1MsgId) {
     await tgDelete(s.gale1MsgId);
     s.gale1MsgId = null;
@@ -877,6 +832,7 @@ async function fecharSinal(s, status, gale) {
   s.gale = gale;
   s.fechadoEm = Date.now();
 
+  // Apaga TODAS as SMS de gale pendentes antes de mandar resultado
   if (s.gale1MsgId) { await tgDelete(s.gale1MsgId); s.gale1MsgId = null; }
   if (s.gale2MsgId) { await tgDelete(s.gale2MsgId); s.gale2MsgId = null; }
 
@@ -889,152 +845,81 @@ async function fecharSinal(s, status, gale) {
   else if (status === 'LOSS') STATS.loss++;
   STATS.total++;
 
-  dbSignalUpdate(s).catch(() => {});
-
-  // 🔥 Resultado awaited, histórico fire-and-forget
+  await dbSignalUpdate(s);
   await tgSendRaw(fmtResult(s));
-  tgFireAndForget(fmtHistorico());
-
+  await tgSendRaw(fmtHistorico());
   maybeSuspend(s.key);
-  log('FECHO', { id: s.id, status, gale, dur: Math.round((Date.now() - s.t) / 1000) });
 }
 
-/* ============================ APURAÇÃO (usa lastRoundId) ============================ */
-
-function roundsAfterSignal(s) {
-  if (s.lastRoundId) {
-    const idx = S.hist.findIndex((r) => r.id === s.lastRoundId);
-    if (idx >= 0) return S.hist.slice(idx + 1);
-  }
-  // fallback para sinais antigos sem lastRoundId
-  return S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
-}
+/* ============================ APURAÇÃO GALE 2 ============================ */
 
 async function apurar() {
-  if (R.apurarBusy) return;
-  R.apurarBusy = true;
   const now = Date.now();
-  const snapshot = [...S.signals];
-  try {
-    for (const s of snapshot) {
-      if (FECHADOS.has(s.status)) continue;
-      const after = roundsAfterSignal(s);
-
-      if (after.length === 0) {
-        if (now - s.t >= CFG.apuraMaxMs) await fecharSinal(s, 'LOSS', 0);
-        continue;
+  for (const s of S.signals) {
+    if (FECHADOS.has(s.status)) continue;
+    const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
+    let decided = false, lastR = null;
+    for (let k = 0; k <= CFG.maxGale && k < after.length; k++) {
+      const r = after[k];
+      const prevT = k === 0 ? s.t : after[k - 1].t;
+      if (r.t - prevT > CFG.gapMs) break;
+      lastR = r;
+      if (r.resultado === s.cor || r.resultado === E) {
+        const status = r.resultado === E ? (k === 0 ? 'EMPATE' : k === 1 ? 'EG1' : 'EG2') : (k === 0 ? 'GREEN' : k === 1 ? 'G1' : 'G2');
+        await fecharSinal(s, status, k); decided = true; break;
       }
-
-      let decided = false;
-      let lastR = null;
-
-      for (let k = 0; k <= CFG.maxGale; k++) {
-        if (k >= after.length) break;
-        const r = after[k];
-        const prevT = k === 0 ? s.t : after[k - 1].t;
-        if (r.t - prevT > CFG.gapMs) break;
-        lastR = r;
-
-        if (r.resultado === s.cor) {
-          const status = k === 0 ? 'GREEN' : k === 1 ? 'G1' : 'G2';
-          await fecharSinal(s, status, k);
-          decided = true;
-          break;
-        }
-        if (r.resultado === E) {
-          const status = k === 0 ? 'EMPATE' : k === 1 ? 'EG1' : 'EG2';
-          await fecharSinal(s, status, k);
-          decided = true;
-          break;
-        }
-
-        if (k < CFG.maxGale && s.galeLevel < k + 1) {
-          await notificarGale(s, k + 1);
-        }
-      }
-
-      if (decided) continue;
-
-      const precisaMaisRodadas = (lastR && s.galeLevel < CFG.maxGale);
-      if (!precisaMaisRodadas && after.length > CFG.maxGale) {
-        await fecharSinal(s, 'LOSS', CFG.maxGale);
-      } else if (now - s.t >= CFG.apuraMaxMs) {
-        await fecharSinal(s, 'LOSS', s.galeLevel || 0);
-      }
+      if (k < CFG.maxGale && s.galeLevel < k + 1) await notificarGale(s, k + 1);
     }
-  } catch (e) {
-    log('APURAR ERR', e.message);
-  } finally {
-    R.apurarBusy = false;
+    if (decided) continue;
+    const eligibleCount = lastR ? after.filter((r) => r.t <= lastR.t).length : 0;
+    if (eligibleCount >= CFG.maxGale + 1) {
+      await fecharSinal(s, 'LOSS', CFG.maxGale);
+    } else if (now - s.t >= CFG.apuraMaxMs) {
+      await fecharSinal(s, 'LOSS', s.galeLevel || 0);
+    }
   }
 }
 
-/* ============================ SYNC (event-driven) ============================ */
+/* ============================ SYNC ============================ */
 
-async function syncLoop() {
-  if (stopping) return;
-  if (R.syncBusy) { scheduleSync(); return; }
-  R.syncBusy = true;
-  const t0 = Date.now();
+async function sync() {
   try {
     const rounds = await fetchRounds();
-    let newRound = null;
-
+    let novos = 0, atualizados = 0;
+    const byId = new Map(S.hist.map((r) => [r.id, r]));
     for (const r of rounds) {
-      if (S.seen.has(r.id)) continue;
-      S.seen.add(r.id);
-      S.hist.push(r);
-      if (!newRound || r.t > newRound.t) newRound = r;
-    }
-
-    if (newRound) {
-      S.hist.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
-      if (S.hist.length > CFG.maxHist) {
-        const ex = S.hist.length - CFG.maxHist;
-        for (let i = 0; i < ex; i++) S.seen.delete(S.hist[i].id);
-        S.hist = S.hist.slice(ex);
+      const previous = byId.get(r.id);
+      if (!previous) { novos++; byId.set(r.id, r); }
+      else if (previous.t !== r.t || previous.resultado !== r.resultado || previous.pj !== r.pj || previous.pb !== r.pb) {
+        Object.assign(previous, r); atualizados++;
       }
-
-      R.ultimaRodadaNova = new Date(newRound.t).toISOString();
-      R.ultimaSync = new Date().toISOString();
-      R.ultimoDetectMs = Date.now() - t0;
-      R.ultimoDelayRodadaMs = Date.now() - newRound.t;
-
-      log('SYNC', {
-        newId: newRound.id, cor: newRound.resultado,
-        detectMs: R.ultimoDetectMs, delayRodadaMs: R.ultimoDelayRodadaMs,
-        total: S.hist.length
-      });
-
-      // 🔥 Em paralelo, sem bloquear — cada um tem guard próprio
-      apurar().catch((e) => log('APURAR ERR', e.message));
-      tentarSinal().catch((e) => log('SIGNAL ERR', e.message));
+      await dbRoundUpsert(r);
     }
-  } catch (e) {
-    R.erroAPI = e.message;
-    log('SYNC ERRO', e.message);
-  } finally {
-    R.syncBusy = false;
-    scheduleSync();
-  }
+    S.hist = [...byId.values()].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
+    if (S.hist.length > CFG.maxHist) S.hist = S.hist.slice(-CFG.maxHist);
+    S.seen = new Set(S.hist.map((r) => r.id));
+    R.ultimaSync = new Date().toISOString();
+    if (rounds.length) R.ultimaRodadaNova = new Date(rounds[rounds.length - 1].t).toISOString();
+    if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length });
+  } catch (e) { R.erroAPI = e.message; log('SYNC ERRO', e.message); }
 }
 
-function scheduleSync() {
-  // 🔥 Intervalo dinâmico: 400ms com pendente, 800ms idle
-  const delay = pendentes().length > 0 ? CFG.syncIntervalPendingMs : CFG.syncIntervalIdleMs;
-  tickSyncTimer = setTimeout(syncLoop, delay);
+async function tick() {
+  if (busy || stopping) return;
+  busy = true; lastTickMs = Date.now();
+  try { await sync(); await apurar(); await tentarSinal(); }
+  catch (e) { log('TICK ERRO', e.message); }
+  finally { busy = false; }
 }
-
-/* ============================ KEEP-ALIVE ============================ */
 
 async function keepAlive() {
   const self = process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || '';
   if (self) { try { await axios.get(self.replace(/\/$/, '') + '/health', { timeout: 7000 }); } catch (_) {} }
-  if (Date.now() - lastTickMs > CFG.syncIntervalIdleMs * 8) {
-    R.wakes++;
-    R.ultimoWake = new Date().toISOString();
-    log('WAKE', 'atraso detectado — reinicia sync');
-    if (!R.syncBusy) scheduleSync();
+}
+function wakeCheck() {
+  if (Date.now() - lastTickMs > CFG.syncMs * 5) {
+    R.wakes++; R.ultimoWake = new Date().toISOString();
+    log('WAKE', 'atraso'); tick().catch(() => {});
   }
 }
 
@@ -1042,48 +927,48 @@ async function keepAlive() {
 
 const app = express();
 app.disable('x-powered-by');
-app.use(cors());
+const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map((x) => x.trim()).filter(Boolean);
+app.use(cors(corsOrigins.length ? { origin: corsOrigins } : { origin: false }));
 app.use(express.json({ limit: '200kb' }));
 
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) return res.status(503).json({ erro: 'ADMIN_TOKEN não configurado' });
+  const supplied = String(req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(ADMIN_TOKEN);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ erro: 'não autorizado' });
+  next();
+}
+
 app.get('/health', (req, res) => {
-  const desdeRodada = S.hist.length ? Date.now() - S.hist[S.hist.length - 1].t : null;
   res.json({
-    ok: true, versao: '17.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale,
+    ok: !R.erroAPI && Boolean(R.ultimaSync), versao: '17.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
-    desdeUltimaRodadaSeg: desdeRodada ? Math.round(desdeRodada / 1000) : null,
-    ultimoDetectMs: R.ultimoDetectMs,
-    ultimoDelayRodadaMs: R.ultimoDelayRodadaMs,
-    ultimoTimingMs: R.ultimoTimingMs,
-    apiBugs: R.apiBugs,
-    loops: { syncBusy: R.syncBusy, apurarBusy: R.apurarBusy, signalBusy: R.signalBusy },
     stats: { ...STATS, greenStreak: getGreenStreak() },
     ultimaSync: R.ultimaSync, erroAPI: R.erroAPI, erroDB: R.erroDB,
     uptime: Math.round(process.uptime())
   });
 });
-app.get('/status', (req, res) => {
-  if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
+app.get('/status', requireAdmin, (req, res) => {
   res.json({ motivo: R.ultimoMotivo, R, STATS, CFG });
 });
-app.get('/sinais', (req, res) => {
-  if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
+app.get('/sinais', requireAdmin, (req, res) => {
   const n = Math.min(100, Math.max(1, parseInt(req.query.n, 10) || 20));
   res.json(S.signals.slice(-n).reverse());
 });
-app.get('/stats', (req, res) => {
-  if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
+app.get('/stats', requireAdmin, (req, res) => {
   const wins = STATS.green + STATS.g1 + STATS.g2 + STATS.empate + STATS.eg1 + STATS.eg2;
   const winsReais = STATS.green + STATS.g1 + STATS.g2;
   const decididos = winsReais + STATS.loss;
   res.json({
-    ...STATS, wins,
+    ...STATS,
+    wins,
     taxaComEmpate: STATS.total > 0 ? wins / STATS.total : null,
     taxaReal: decididos > 0 ? winsReais / decididos : null,
     greenStreak: getGreenStreak()
   });
 });
-app.get('/calibracao', (req, res) => {
-  if (ADMIN_TOKEN && req.query.token !== ADMIN_TOKEN) return res.status(401).json({ erro: 'token' });
+app.get('/calibracao', requireAdmin, (req, res) => {
   const buckets = { '80-85': { n: 0, w: 0 }, '86-92': { n: 0, w: 0 }, '93-95': { n: 0, w: 0 } };
   for (const s of S.signals) {
     if (!FECHADOS.has(s.status)) continue;
@@ -1097,58 +982,45 @@ app.get('/calibracao', (req, res) => {
 /* ============================ START ============================ */
 
 async function start() {
-  log('BOOT', {
-    versao: '17.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale,
-    syncPendingMs: CFG.syncIntervalPendingMs, syncIdleMs: CFG.syncIntervalIdleMs,
-    atrasoRodadaMs: CFG.atrasoRodadaMs
-  });
+  for (const [name, value] of Object.entries({ BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL })) {
+    if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
+  }
+  if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
+  log('BOOT', { versao: '17.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale });
   await dbInit();
-  if (pool) await dbLoadState();
-  await syncFirst();
+  if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
+  await dbLoadState();
+  await sync();
   getStats(true);
 
-  // Recupera PENDENTES
+  // Recupera PENDENTES: re-checa se já saiu resultado
   if (pool) {
     for (const s of S.signals) {
       if (s.status !== 'PENDENTE') continue;
-      const after = roundsAfterSignal(s);
-      let consecutivasFalhas = 0;
+      const after = S.hist.filter((r) => r.t > s.t).sort((a, b) => a.t - b.t);
+      let consecutivasFalhas = 0, prevT = s.t;
       for (const r of after) {
-        if (r.resultado === s.cor || r.resultado === E) break;
-        consecutivasFalhas++;
-        if (consecutivasFalhas > CFG.maxGale) break;
+        if (r.t - prevT > CFG.gapMs || r.resultado === s.cor || r.resultado === E) break;
+        consecutivasFalhas++; prevT = r.t;
+        if (consecutivasFalhas >= CFG.maxGale) break;
       }
       s.galeLevel = Math.min(consecutivasFalhas, CFG.maxGale);
     }
   }
 
   server = app.listen(PORT, () => log('HTTP', `porta ${PORT}`));
-  scheduleSync();
-  keepTimer = setInterval(() => { keepAlive().catch(() => {}); }, CFG.keepAliveMs);
+  tickTimer = setInterval(() => tick().catch(() => {}), CFG.syncMs);
+  keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
+  setTimeout(() => tick().catch(() => {}), 2000);
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
-
-async function syncFirst() {
-  try {
-    const rounds = await fetchRounds();
-    for (const r of rounds) {
-      if (S.seen.has(r.id)) continue;
-      S.seen.add(r.id);
-      S.hist.push(r);
-    }
-    S.hist.sort((a, b) => a.t - b.t || (a.id < b.id ? -1 : 1));
-    log('SYNC BOOT', { total: S.hist.length });
-  } catch (e) { log('SYNC BOOT ERRO', e.message); }
-}
-
 async function shutdown() {
   if (stopping) return;
   stopping = true; log('SHUTDOWN', 'ok');
-  clearTimeout(tickSyncTimer);
-  clearInterval(keepTimer);
-  if (server) server.close();
+  clearInterval(tickTimer); clearInterval(keepTimer);
+  if (server) await new Promise((resolve) => server.close(resolve));
   if (pool) await pool.end().catch(() => {});
   process.exit(0);
 }
