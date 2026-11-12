@@ -1,6 +1,6 @@
 {
   "name": "capunga-bacbo-server",
-  "version": "18.0.0",
+  "version": "19.0.0",
   "private": true,
   "description": "Capunga Bac Bo signals server",
   "main": "server.js",
