@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v21.1
+ * CAPUNGA DADOS — BAC BO · v21.3
  *
  * ALTERAÇÕES v20 (vs v19) — baseadas na auditoria do histórico real:
  *  1. GATE DE FRESQUIDÃO: se a última rodada recebida tiver mais de maxStaleMs
@@ -114,7 +114,7 @@ const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, l
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.2',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.3',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
@@ -122,6 +122,8 @@ const R = {
 };
 
 let pool = null, lockClient = null, server = null, tickTimer = null, keepTimer = null;
+let lockRetryTimer = null;
+let leaderReady = false, acquiringLeader = false;
 let busy = false, stopping = false, lastTickMs = Date.now();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1337,7 +1339,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: Boolean(server) && !R.erroDB,
     role: leaderReady ? 'leader' : 'standby',
-    versao: '21.2', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    versao: '21.3', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     dadosStale: R.dadosStale,
@@ -1461,7 +1463,7 @@ async function start() {
     throw new Error('DATABASE_URL inválido');
   }
 
-  log('BOOT', { versao: '21.2', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  log('BOOT', { versao: '21.3', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
