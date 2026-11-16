@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v21
+ * CAPUNGA DADOS — BAC BO · v21.1
  *
  * ALTERAÇÕES v20 (vs v19) — baseadas na auditoria do histórico real:
  *  1. GATE DE FRESQUIDÃO: se a última rodada recebida tiver mais de maxStaleMs
@@ -43,8 +43,10 @@ const CFG = {
   maxGale: 2,
   maxPending: 1,
   minAmostra: 60,
-  syncMs: 3000,               // polling normal
-  syncFastMs: 1000,           // polling com sinal pendente / mesa quente
+  syncMs: 5000,               // polling normal, reduz pressão sobre a API
+  syncFastMs: 3000,           // polling rápido; apuração continua a cada 1s
+  api429BaseMs: 15000,        // espera inicial após HTTP 429
+  api429MaxMs: 180000,        // limite do backoff exponencial (3 min)
   minGapMs: 20000,            // entre sinais (quando há oportunidade)
   relaxMs: 3 * 60 * 1000,     // 3min sem sinal -> relaxa os filtros
   forceSignalMs: 5 * 60 * 1000, // 5min -> melhor oportunidade disponível (SÓ com dados frescos)
@@ -88,6 +90,9 @@ const API_SOURCES = [
   process.env.API_BACBO_2 || ''
 ].filter(Boolean);
 
+// Estado independente por fonte: um 429 não provoca novas tentativas imediatas.
+const API_SOURCE_STATE = API_SOURCES.map(() => ({ failures429: 0, blockedUntil: 0 }));
+
 const DEPLOY_ID = (() => {
   if (process.env.DEPLOY_ID) return String(process.env.DEPLOY_ID).trim();
   try { return crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex').slice(0, 16); }
@@ -109,7 +114,7 @@ const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, l
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.0',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.1',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
@@ -502,10 +507,19 @@ function normalizeRound(item) {
   return { id, resultado, t, pj, pb };
 }
 
+function retryAfterMs(error) {
+  const raw = error?.response?.headers?.['retry-after'] ?? error?.response?.headers?.['Retry-After'];
+  if (raw === undefined || raw === null || raw === '') return 0;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  const date = Date.parse(String(raw));
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
 async function fetchFrom(url) {
   const resp = await axios.get(url, {
     timeout: 10000,
-    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/21.0' }
+    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/21.1' }
   });
   const map = new Map();
   for (const it of extractItems(resp.data)) {
@@ -519,24 +533,55 @@ async function fetchFrom(url) {
   return rounds;
 }
 
-// Fallback automático entre fontes: se a primária falhar, tenta a secundária
+// Fallback automático, com cooldown por fonte em caso de rate limit HTTP 429.
 async function fetchRounds() {
   const erros = [];
+  const now = Date.now();
+  let tentouFonte = false;
+
   for (let idx = 0; idx < API_SOURCES.length; idx++) {
+    const state = API_SOURCE_STATE[idx];
+    if (state.blockedUntil > now) {
+      const restante = Math.ceil((state.blockedUntil - now) / 1000);
+      erros.push(`fonte${idx + 1}: limite 429; em espera ${restante}s`);
+      continue;
+    }
+
+    tentouFonte = true;
+    // Dois ensaios apenas para erros transitórios normais. Em 429 nunca repetir já.
     for (let tentativa = 1; tentativa <= 2; tentativa++) {
       try {
         const rounds = await fetchFrom(API_SOURCES[idx]);
+        state.failures429 = 0;
+        state.blockedUntil = 0;
         R.fonteAPI = idx;
         R.erroAPI = null;
         return rounds;
       } catch (e) {
+        const status = Number(e?.response?.status || e?.status || 0);
+        if (status === 429) {
+          state.failures429 += 1;
+          const exponential = Math.min(
+            CFG.api429MaxMs,
+            CFG.api429BaseMs * Math.pow(2, Math.max(0, state.failures429 - 1))
+          );
+          const serverWait = retryAfterMs(e);
+          // Nunca encurtar o Retry-After enviado pelo servidor da API.
+          const waitMs = Math.max(exponential, serverWait);
+          state.blockedUntil = Date.now() + waitMs;
+          erros.push(`fonte${idx + 1}: HTTP 429; pausa ${Math.ceil(waitMs / 1000)}s`);
+          break;
+        }
+
         erros.push(`fonte${idx + 1}: ${e.message}`);
-        if (tentativa < 2) await sleep(500);
+        if (tentativa < 2) await sleep(1000);
       }
     }
   }
+
+  if (!tentouFonte && erros.length === 0) erros.push('todas as fontes estão temporariamente indisponíveis');
   R.erroAPI = erros.join(' | ');
-  throw new Error(R.erroAPI);
+  throw new Error(R.erroAPI || 'nenhuma fonte API disponível');
 }
 
 /* ============================ HELPERS ============================ */
@@ -1163,7 +1208,7 @@ function currentSyncMs() {
   if (pendentes().length > 0) return CFG.syncFastMs;
   const last = S.hist[S.hist.length - 1];
   if (last && Date.now() - last.t < 45000) return CFG.syncFastMs; // mesa quente
-  if (S.awaitingRecovery > 0) return CFG.syncFastMs; // v20: retoma em curso, monitorar de perto
+  if (S.awaitingRecovery > 0) return CFG.syncFastMs; // retoma em curso, monitorar de perto
   return CFG.syncMs;
 }
 
@@ -1280,7 +1325,7 @@ app.get('/health', (req, res) => {
   const newest = S.hist[S.hist.length - 1];
   res.json({
     ok: !R.erroAPI && Boolean(R.ultimaSync) && R.lockOk,
-    versao: '21.0', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    versao: '21.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     dadosStale: R.dadosStale,
@@ -1352,7 +1397,7 @@ async function start() {
     if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
   }
   if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
-  log('BOOT', { versao: '21.0', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  log('BOOT', { versao: '21.1', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
