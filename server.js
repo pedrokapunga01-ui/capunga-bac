@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v21.1
+ * CAPUNGA DADOS — BAC BO · v21.4
  *
  * ALTERAÇÕES v20 (vs v19) — baseadas na auditoria do histórico real:
  *  1. GATE DE FRESQUIDÃO: se a última rodada recebida tiver mais de maxStaleMs
@@ -114,14 +114,16 @@ const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, l
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.1',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.4',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
-  ultimoAlertaAPI: 0, ultimoAlertaDB: 0, lockOk: false, dadosStale: false
+  ultimoAlertaAPI: 0, ultimoAlertaDB: 0, lockOk: false, dadosStale: false, apiBlocked: false
 };
 
 let pool = null, lockClient = null, server = null, tickTimer = null, keepTimer = null;
+let lockRetryTimer = null;
+let leaderReady = false, acquiringLeader = false;
 let busy = false, stopping = false, lastTickMs = Date.now();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -172,21 +174,32 @@ async function dbInit() {
 }
 
 async function acquireLock() {
-  if (!pool) return false;
-  for (let i = 1; i <= 10; i++) {
-    try {
-      // Advisory locks são por sessão: manter a mesma ligação até ao shutdown.
-      if (!lockClient) lockClient = await pool.connect();
-      const r = await lockClient.query('SELECT pg_try_advisory_lock($1) AS ok', [LOCK_KEY]);
-      if (r.rows[0].ok) { R.lockOk = true; return true; }
-      log('LOCK', `instância concorrente detectada — tentativa ${i}/10`);
-    } catch (e) {
-      R.erroDB = e.message; log('LOCK ERRO', e.message);
-      if (lockClient) { lockClient.release(); lockClient = null; }
+  if (!pool || stopping) return false;
+  try {
+    // O lock é exclusivo por sessão PostgreSQL. Cada processo tenta uma vez;
+    // se a versão anterior ainda estiver ativa, esta instância fica em espera.
+    if (!lockClient) lockClient = await pool.connect();
+    const r = await lockClient.query(
+      'SELECT pg_try_advisory_lock($1) AS ok', [LOCK_KEY]
+    );
+    if (r.rows[0].ok) {
+      R.lockOk = true;
+      log('LOCK', 'bloqueio adquirido');
+      return true;
     }
-    await sleep(15000);
+    log('LOCK', 'outra instância ainda ativa; aguardando libertação');
+    lockClient.release();
+    lockClient = null;
+    return false;
+  } catch (e) {
+    R.erroDB = e.message;
+    log('LOCK ERRO', e.message);
+    if (lockClient) {
+      lockClient.release();
+      lockClient = null;
+    }
+    return false;
   }
-  return false;
 }
 async function releaseLock() {
   if (!lockClient) return;
@@ -519,7 +532,7 @@ function retryAfterMs(error) {
 async function fetchFrom(url) {
   const resp = await axios.get(url, {
     timeout: 10000,
-    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/21.1' }
+    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/21.4' }
   });
   const map = new Map();
   for (const it of extractItems(resp.data)) {
@@ -985,6 +998,8 @@ function tierAtual() {
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
 function podeGerar() {
+  // v21.4: nunca gerar sinal usando cache após uma falha de sincronização/API.
+  if (R.apiBlocked) { R.ultimoMotivo = 'API sem sincronização válida; sinais bloqueados'; return false; }
   if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return false; }
   if (pendentes().length >= CFG.maxPending) { R.ultimoMotivo = 'max pending'; return false; }
   const now = Date.now();
@@ -1213,12 +1228,15 @@ function currentSyncMs() {
 }
 
 async function sync() {
+  const apiEstavaBloqueada = R.apiBlocked;
   try {
     const rounds = await fetchRounds();
     let novos = 0, atualizados = 0;
     const newestBefore = S.hist[S.hist.length - 1];
     const newestBeforeT = newestBefore ? newestBefore.t : 0;
     const wasStaleBefore = !newestBefore || Date.now() - newestBefore.t > CFG.maxStaleMs;
+    // Só desbloqueia depois de fetch válido e persistência das rodadas.
+    R.apiBlocked = false;
     const byId = new Map(S.hist.map((r) => [r.id, r]));
     for (const r of rounds) {
       const previous = byId.get(r.id);
@@ -1248,7 +1266,7 @@ async function sync() {
       }
     } else {
       R.dadosStale = false;
-      if (wasStaleBefore && S.awaitingRecovery === 0) {
+      if ((wasStaleBefore || apiEstavaBloqueada) && S.awaitingRecovery === 0) {
         S.awaitingRecovery = CFG.recoveryRounds;
         log('RETOMA', `dados recuperados — exigindo ${CFG.recoveryRounds} rodadas novas`);
       }
@@ -1270,6 +1288,9 @@ async function sync() {
     if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length, fonte: R.fonteAPI + 1, retoma: S.awaitingRecovery });
 
   } catch (e) {
+    // v21.4: falha de API/429 suspende sinais imediatamente, mesmo com cache recente.
+    R.apiBlocked = true;
+    S.awaitingRecovery = Math.max(S.awaitingRecovery, CFG.recoveryRounds);
     R.erroAPI = e.message;
     log('SYNC ERRO', e.message);
     await tgAlert('API', `Erro ao consultar API BACBO:\n<code>${e.message}</code>`);
@@ -1324,11 +1345,13 @@ function requireAdmin(req, res, next) {
 app.get('/health', (req, res) => {
   const newest = S.hist[S.hist.length - 1];
   res.json({
-    ok: !R.erroAPI && Boolean(R.ultimaSync) && R.lockOk,
-    versao: '21.1', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    ok: Boolean(server) && !R.erroDB,
+    role: leaderReady ? 'leader' : 'standby',
+    versao: '21.4', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     dadosStale: R.dadosStale,
+    apiBlocked: R.apiBlocked,
     aguardaRetoma: S.awaitingRecovery,
     rodasRetoma: CFG.recoveryRounds,
     diario: { ...DAILY, taxa: dailyTaxa() }, geral: ALLTIME,
@@ -1392,44 +1415,88 @@ app.get('/calibracao', requireAdmin, (req, res) => {
 
 /* ============================ START ============================ */
 
+async function becomeLeader() {
+  if (leaderReady || acquiringLeader || stopping) return;
+  acquiringLeader = true;
+  try {
+    const locked = await acquireLock();
+    if (!locked) return;
+
+    // Só a instância que detém o advisory lock pode carregar estado,
+    // consultar a API, apurar sinais ou enviar mensagens.
+    await dbLoadState();
+    await dbLoadAlltime();
+    await sync();
+    getStats(true);
+
+    const last = S.hist[S.hist.length - 1];
+    if (!last || Date.now() - last.t > CFG.maxStaleMs) {
+      S.awaitingRecovery = CFG.recoveryRounds;
+    }
+
+    for (const s of S.signals) {
+      if (s.status !== 'PENDENTE') continue;
+      const after = S.hist.filter((r) =>
+        r.t > s.t && (!s.triggerRoundId || r.id !== s.triggerRoundId)
+      ).sort((a, b) => a.t - b.t);
+      let consecutivasFalhas = 0;
+      let prevT = s.t;
+      for (const r of after) {
+        if (r.t - prevT > CFG.gapMs || r.resultado === s.cor || r.resultado === E) break;
+        consecutivasFalhas++;
+        prevT = r.t;
+        if (consecutivasFalhas >= CFG.maxGale) break;
+      }
+      s.galeLevel = Math.min(consecutivasFalhas, CFG.maxGale);
+    }
+
+    leaderReady = true;
+    R.ultimoMotivo = 'Instância principal ativa';
+    log('LEADER', 'instância principal ativa; bot iniciado');
+    tickTimer = setInterval(() => tick().catch((e) => log('TICK ERRO', e.message)), 1000);
+    setTimeout(() => tick().catch((e) => log('TICK ERRO', e.message)), 1000);
+  } catch (e) {
+    R.ultimoMotivo = `Falha ao assumir liderança: ${e.message}`;
+    log('LEADER ERRO', e.stack || e.message);
+    await releaseLock();
+  } finally {
+    acquiringLeader = false;
+  }
+}
+
 async function start() {
   for (const [name, value] of Object.entries({ BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL })) {
     if (!value) throw new Error(`Variável obrigatória em falta: ${name}`);
   }
-  if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) throw new Error('DATABASE_URL inválido');
-  log('BOOT', { versao: '21.1', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  if (!/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) {
+    throw new Error('DATABASE_URL inválido');
+  }
+
+  log('BOOT', { versao: '21.4', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
-  const locked = await acquireLock();
-  if (!locked) throw new Error('Outra instância do bot está ativa (advisory lock). Encerrando.');
+  // IMPORTANTE: abrir a porta antes de tentar o advisory lock.
+  // Durante deploys sobrepostos, o processo antigo pode ainda deter o lock.
+  server = app.listen(PORT, '0.0.0.0', () => {
+    log('HTTP', `porta ${PORT} aberta; aguardando liderança PostgreSQL`);
+  });
 
-  await dbLoadState();
-  await sync();
-  getStats(true);
+  server.on('error', (e) => {
+    log('HTTP ERRO', e.message);
+    R.ultimoMotivo = `Erro HTTP: ${e.message}`;
+  });
 
-  // v20: se arrancar com dados parados, entra em modo retoma
-  const last = S.hist[S.hist.length - 1];
-  if (!last || Date.now() - last.t > CFG.maxStaleMs) S.awaitingRecovery = CFG.recoveryRounds;
+  // Primeira tentativa e novas tentativas sem encerrar o serviço.
+  await becomeLeader();
+  lockRetryTimer = setInterval(() => {
+    if (!leaderReady) becomeLeader().catch((e) => log('LOCK RETRY ERRO', e.message));
+  }, 15000);
 
-  // Recupera PENDENTES com a regra de gap
-  for (const s of S.signals) {
-    if (s.status !== 'PENDENTE') continue;
-    const after = S.hist.filter((r) => r.t > s.t && (!s.triggerRoundId || r.id !== s.triggerRoundId)).sort((a, b) => a.t - b.t);
-    let consecutivasFalhas = 0, prevT = s.t;
-    for (const r of after) {
-      if (r.t - prevT > CFG.gapMs || r.resultado === s.cor || r.resultado === E) break;
-      consecutivasFalhas++; prevT = r.t;
-      if (consecutivasFalhas >= CFG.maxGale) break;
-    }
-    s.galeLevel = Math.min(consecutivasFalhas, CFG.maxGale);
-  }
-
-  server = app.listen(PORT, () => log('HTTP', `porta ${PORT}`));
-  // tick a CADA 1 SEGUNDO — sync interno é adaptativo (1s quente / 3s normal)
-  tickTimer = setInterval(() => tick().catch(() => {}), 1000);
-  keepTimer = setInterval(() => { keepAlive().catch(() => {}); wakeCheck(); }, CFG.keepAliveMs);
-  setTimeout(() => tick().catch(() => {}), 1500);
+  keepTimer = setInterval(() => {
+    if (leaderReady) keepAlive().catch(() => {});
+    wakeCheck();
+  }, CFG.keepAliveMs);
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
@@ -1437,7 +1504,7 @@ async function start() {
 async function shutdown() {
   if (stopping) return;
   stopping = true; log('SHUTDOWN', 'ok');
-  clearInterval(tickTimer); clearInterval(keepTimer);
+  clearInterval(tickTimer); clearInterval(keepTimer); clearInterval(lockRetryTimer);
   if (server) await new Promise((resolve) => server.close(resolve));
   await releaseLock();
   if (pool) await pool.end().catch(() => {});
