@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v21.6
+ * CAPUNGA DADOS — BAC BO · v21.8
  *
  * ALTERAÇÕES v20 (vs v19) — baseadas na auditoria do histórico real:
  *  1. GATE DE FRESQUIDÃO: se a última rodada recebida tiver mais de maxStaleMs
@@ -18,8 +18,8 @@
  *     ou empate/devolução), com prior neutro. Empate = não perder, não vitória.
  *  5. TIER 2 SÓ COM DADOS FRESCOS: a escada de relaxamento continua a existir,
  *     mas nunca opera com dados parados.
- *  6. v21: mantém a tabela de sinais v20 e todo o histórico persistido; acrescenta
- *     recuperação consistente, histórico consultável e mensagens sem numeração.
+ *  6. v21.8: fallback API por fonte, cooldown 429 persistido e estratégias avaliadas
+ *     numa janela cronológica recente, priorizando GREEN direto + G1.
  *
  * Env: BOT_TOKEN, CHAT_ID, ADMIN_TOKEN, DATABASE_URL, PORT,
  *      API_BACBO (opcional), API_BACBO_2 (opcional)
@@ -85,14 +85,17 @@ const opp = (c) => (c === J ? B : c === B ? J : null);
 const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS', 'EXPIRADO', 'CANCELADO']);
 const LOCK_KEY = Number(process.env.LOCK_KEY || 727272);
 
-const API_SOURCES = [
-  process.env.API_BACBO ||
-    'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie',
-  process.env.API_BACBO_2 || ''
-].filter(Boolean);
+const DEFAULT_API_URL = 'https://api-cs.casino.org/svc-evolution-game-events/api/bacbo?page=0&size=50&sort=data.settledAt,desc&duration=120&wheelResults=PlayerWon,BankerWon,Tie';
+const API_SOURCES = [...new Set([
+  String(process.env.API_BACBO || '').trim() || DEFAULT_API_URL,
+  String(process.env.API_BACBO_2 || '').trim()
+].filter(Boolean))];
 
-// Estado independente por fonte: um 429 não provoca novas tentativas imediatas.
-const API_SOURCE_STATE = API_SOURCES.map(() => ({ failures429: 0, blockedUntil: 0 }));
+// Estado independente por fonte. Uma fonte em 429 fica em cooldown;
+// as outras continuam a ser tentadas como fallback, sem repetir a fonte bloqueada.
+const API_SOURCE_STATE = API_SOURCES.map(() => ({
+  failures429: 0, blockedUntil: 0, lastSuccessAt: 0, lastError: null
+}));
 
 const DEPLOY_ID = (() => {
   if (process.env.DEPLOY_ID) return String(process.env.DEPLOY_ID).trim();
@@ -115,7 +118,7 @@ const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, l
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.6',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.8',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
@@ -382,6 +385,56 @@ async function dbLoadState() {
   } catch (e) { R.erroDB = e.message; log('DB ERRO load', e.message); }
 }
 
+// v21.8: conserva o cooldown 429 no PostgreSQL para que um redeploy não
+// provoque uma nova chamada imediata à API que acabou de limitar o servidor.
+async function restoreApiCooldown() {
+  if (!pool) return;
+  const raw = await dbStateGet('apiCooldown_v21');
+  if (!raw) return;
+  try {
+    const saved = JSON.parse(raw);
+    const now = Date.now();
+    for (let i = 0; i < API_SOURCE_STATE.length; i++) {
+      const item = saved[i] || {};
+      API_SOURCE_STATE[i].failures429 = Math.max(0, Number(item.failures429) || 0);
+      API_SOURCE_STATE[i].blockedUntil = Math.max(0, Number(item.blockedUntil) || 0);
+    }
+    const blocked = API_SOURCE_STATE
+      .map((state, i) => ({ state, i }))
+      .filter(({ state }) => state.blockedUntil > now);
+    if (blocked.length) {
+      R.apiBlocked = true;
+      R.erroAPI = blocked.map(({ state, i }) =>
+        `fonte${i + 1}: limite 429; em espera ${Math.ceil((state.blockedUntil - now) / 1000)}s`
+      ).join(' | ');
+      S.awaitingRecovery = Math.max(S.awaitingRecovery, CFG.recoveryRounds);
+      log('API COOLDOWN', `bloqueio recuperado do PostgreSQL: ${R.erroAPI}`);
+    }
+  } catch (e) {
+    log('API COOLDOWN AVISO', `estado persistido inválido; ignorado: ${e.message}`);
+  }
+}
+
+async function persistApiCooldown() {
+  if (!pool) return false;
+  try {
+    const value = JSON.stringify(API_SOURCE_STATE.map((state) => ({
+      failures429: state.failures429,
+      blockedUntil: state.blockedUntil
+    })));
+    await pool.query(
+      `INSERT INTO capunga_state(k,v,updated_at) VALUES ($1,$2,NOW())
+       ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()`,
+      ['apiCooldown_v21', value]
+    );
+    return true;
+  } catch (e) {
+    R.erroDB = e.message;
+    log('API COOLDOWN DB ERRO', e.message);
+    return false;
+  }
+}
+
 /* ============================ TELEGRAM ============================ */
 
 async function tgSendRaw(texto) {
@@ -581,7 +634,7 @@ function retryAfterMs(error) {
 async function fetchFrom(url) {
   const resp = await axios.get(url, {
     timeout: 10000,
-    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/21.6' }
+    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/21.8' }
   });
   const map = new Map();
   for (const it of extractItems(resp.data)) {
@@ -595,7 +648,9 @@ async function fetchFrom(url) {
   return rounds;
 }
 
-// Fallback automático, com cooldown por fonte em caso de rate limit HTTP 429.
+// Fallback no estilo v19: percorre as fontes em ordem e faz até duas tentativas
+// para falhas transitórias. Diferença de segurança: HTTP 429 NUNCA é repetido
+// imediatamente; respeita Retry-After e passa diretamente à próxima fonte.
 async function fetchRounds() {
   const erros = [];
   const now = Date.now();
@@ -610,17 +665,31 @@ async function fetchRounds() {
     }
 
     tentouFonte = true;
-    // Dois ensaios apenas para erros transitórios normais. Em 429 nunca repetir já.
     for (let tentativa = 1; tentativa <= 2; tentativa++) {
       try {
         const rounds = await fetchFrom(API_SOURCES[idx]);
+        const saiuDeCooldown = state.failures429 > 0 || state.blockedUntil > 0;
         state.failures429 = 0;
         state.blockedUntil = 0;
+        state.lastSuccessAt = Date.now();
+        state.lastError = null;
         R.fonteAPI = idx;
         R.erroAPI = null;
+
+        // Persistir a limpeza do cooldown evita que um deploy futuro restaure
+        // um bloqueio antigo depois de a fonte já ter recuperado.
+        if (saiuDeCooldown && !(await persistApiCooldown())) {
+          const persistError = new Error('API recuperada, mas não foi possível persistir o estado do cooldown no PostgreSQL');
+          persistError.code = 'API_COOLDOWN_PERSIST_FAILED';
+          throw persistError;
+        }
+        if (idx > 0) log('API FAILOVER', `fonte principal indisponível; dados recebidos da fonte${idx + 1}`);
         return rounds;
       } catch (e) {
+        if (e?.code === 'API_COOLDOWN_PERSIST_FAILED') throw e;
         const status = Number(e?.response?.status || e?.status || 0);
+        state.lastError = status ? `HTTP ${status}` : String(e.message || 'erro desconhecido');
+
         if (status === 429) {
           state.failures429 += 1;
           const exponential = Math.min(
@@ -628,14 +697,16 @@ async function fetchRounds() {
             CFG.api429BaseMs * Math.pow(2, Math.max(0, state.failures429 - 1))
           );
           const serverWait = retryAfterMs(e);
-          // Nunca encurtar o Retry-After enviado pelo servidor da API.
+          // Nunca encurtar o Retry-After indicado pelo servidor.
           const waitMs = Math.max(exponential, serverWait);
           state.blockedUntil = Date.now() + waitMs;
+          const persisted = await persistApiCooldown();
           erros.push(`fonte${idx + 1}: HTTP 429; pausa ${Math.ceil(waitMs / 1000)}s`);
-          break;
+          if (!persisted) erros.push('não foi possível guardar o cooldown no PostgreSQL');
+          break; // não repetir 429; tentar a próxima fonte, se existir
         }
 
-        erros.push(`fonte${idx + 1}: ${e.message}`);
+        erros.push(`fonte${idx + 1} tentativa ${tentativa}: ${e.message}`);
         if (tentativa < 2) await sleep(1000);
       }
     }
@@ -910,14 +981,33 @@ const STRATS = [
   }
 ];
 
-// v21.6: apenas padrões que tiveram melhor resultado no histórico auditado.
-// Os restantes continuam no código para auditoria/backtest, mas não podem emitir sinais.
+// v21.8: seleção baseada no ficheiro histórico auditado (1.831 sinais fechados).
+// Métrica de seleção = GREEN direto + G1; LOSS fica separado. Os restantes
+// padrões continuam disponíveis no código, mas não podem emitir sinais.
+// Estes números são históricos, não garantias de resultados futuros.
 const ACTIVE_STRATEGIES = new Set([
-  'PLAYER_BIAS_20',  // Viés Jogador: n=94, loss histórico 5,3%; Viés Banca excluído
-  'SEQ_2x2',         // Bloco 2+2: n=111, loss histórico 6,3%
-  'SEQ_ALT_STRONG',  // Alternância forte: n=32, loss histórico 6,2%
-  'NUM_DOUBLE_HIGH'  // Dupla margem alta: n=25, loss histórico 4,0%
+  'PLAYER_BIAS_20',  // holdout histórico: n=31; direto+G1 77,4%; LOSS 3,2%
+  'SEQ_ALT_STRONG',  // holdout: n=10; direto+G1 70,0%; LOSS 0% (amostra pequena)
+  'SEQ_2x2',         // holdout: n=43; direto+G1 60,5%; LOSS 7,0%
+  'SEQ_SURF_4',      // holdout: n=34; direto+G1 64,7%; LOSS 5,9%
+  'SEQ_REP_5',       // holdout: n=19; direto+G1 63,2%; LOSS 5,3%
+  'TIE_SINGLE',      // Empate isolado; holdout: n=50; direto+G1 64,0%; LOSS 8,0%
+  'NUM_DOUBLE_HIGH', // holdout: n=9; precisa de mais validação antes de emitir
+  'TIE_DOUBLE_BACK'  // holdout: n=8; precisa de mais validação antes de emitir
 ]);
+
+// Regras combinam amostra total e validação cronológica recente.
+// Padrões com amostra pequena só passam quando acumularem validação suficiente.
+const STRATEGY_RULES = Object.freeze({
+  PLAYER_BIAS_20:  { minN: 40, minValidationN: 20, minDirectG1: 0.65, maxValidationLoss: 0.12 },
+  SEQ_ALT_STRONG:  { minN: 25, minValidationN: 12, minDirectG1: 0.60, maxValidationLoss: 0.15 },
+  SEQ_2x2:         { minN: 40, minValidationN: 20, minDirectG1: 0.58, maxValidationLoss: 0.12 },
+  SEQ_SURF_4:      { minN: 40, minValidationN: 15, minDirectG1: 0.60, maxValidationLoss: 0.12 },
+  SEQ_REP_5:       { minN: 30, minValidationN: 10, minDirectG1: 0.58, maxValidationLoss: 0.12 },
+  TIE_SINGLE:      { minN: 40, minValidationN: 20, minDirectG1: 0.60, maxValidationLoss: 0.12 },
+  NUM_DOUBLE_HIGH: { minN: 25, minValidationN: 12, minDirectG1: 0.60, maxValidationLoss: 0.15 },
+  TIE_DOUBLE_BACK: { minN: 25, minValidationN: 12, minDirectG1: 0.60, maxValidationLoss: 0.15 }
+});
 
 function runStrategies(rows) {
   const seq = rows.filter((r) => isCol(r.resultado));
@@ -955,29 +1045,55 @@ function backtest() {
   const H = S.hist;
   const per = {};
   const ini = 10, fim = H.length - 1;
-  if (fim - ini < 30) return { per, baseRate: 0.85 };
+  if (fim - ini < 40) return { per, baseRate: 0.75, validationStart: 0 };
+
+  // Validação cronológica: primeiros 70% para referência e últimos 30% para
+  // teste recente. As 3 entradas imediatamente antes do corte ficam fora do
+  // treino porque o resultado delas poderia atravessar para a janela de teste.
+  const validationStart = Math.floor(H.length * 0.70);
+  const trainEnd = validationStart - (CFG.maxGale + 1);
   let bw = 0, bn = 0;
+
   for (let i = ini; i < fim; i++) {
     const win = windowAt(H, i);
     if (win.length < 6) continue;
     for (const c of runStrategies(win)) {
       const v = evalEntry(H, i, c.cor);
       if (v === null) continue;
-      const p = per[c.key] || (per[c.key] = { n: 0, w: 0, direct: 0, g1: 0, g2: 0, draws: 0, loss: 0 });
+      const p = per[c.key] || (per[c.key] = {
+        n: 0, w: 0, direct: 0, g1: 0, g2: 0, draws: 0, loss: 0,
+        trainN: 0, trainNonLoss: 0, trainDirect: 0, trainG1: 0, trainLoss: 0,
+        validationN: 0, validationNonLoss: 0, validationDirect: 0,
+        validationG1: 0, validationLoss: 0
+      });
       p.n++;
-      if (v !== 'LOSS') { p.w++; bn++; bw++; } else { bn++; }
+      bn++;
+      if (v !== 'LOSS') { p.w++; bw++; }
       if (v === 'GREEN') p.direct++;
       else if (v === 'G1') p.g1++;
       else if (v === 'G2') p.g2++;
       else if (v === 'EMPATE' || v === 'EG1' || v === 'EG2') p.draws++;
       else if (v === 'LOSS') p.loss++;
+
+      const bucket = i < trainEnd ? 'train' : i >= validationStart ? 'validation' : null;
+      if (bucket) {
+        p[`${bucket}N`]++;
+        if (v !== 'LOSS') p[`${bucket}NonLoss`]++;
+        if (v === 'GREEN') p[`${bucket}Direct`]++;
+        else if (v === 'G1') p[`${bucket}G1`]++;
+        else if (v === 'LOSS') p[`${bucket}Loss`]++;
+      }
     }
   }
-  // v20: prior neutro 0.85 (≈ 1 - 0.5^3 de acertar numa cor em 3 rodadas),
-  // sem clamp mágico de 0.90. Limites apenas de sanidade.
-  const baseRate = bn ? bw / bn : 0.85;
-  return { per, baseRate: Math.min(CFG.baseRateMax, Math.max(CFG.baseRateMin, baseRate)) };
+
+  const baseRate = bn ? bw / bn : 0.75;
+  return {
+    per,
+    baseRate: Math.min(CFG.baseRateMax, Math.max(CFG.baseRateMin, baseRate)),
+    validationStart
+  };
 }
+
 function getStats(force = false) {
   if (force || !S.stats || S.hist.length - S.statsAtLen >= 30) {
     S.stats = backtest();
@@ -986,7 +1102,7 @@ function getStats(force = false) {
   return S.stats;
 }
 
-/* ============================ ÍNDICE ESTATÍSTICO (v21.6) ============================
+/* ============================ ÍNDICE ESTATÍSTICO (v21.8) ============================
  * conf = taxa histórica de NÃO PERDER até G2 (green, gale ou empate/devolução).
  * Prior do backtest + amostra real, SEM piso fabricado de 80.
  * Um número alto aqui não é garantia: é o histórico observado dessa estratégia. */
@@ -995,15 +1111,12 @@ function bayesianRate(w, n, priorRate, priorWeight) {
   return (w + priorRate * priorWeight) / (n + priorWeight);
 }
 function confianca(cand, ctx) {
-  const stats = ctx.stats;
-  const p = stats.per[cand.key] || { n: 0, w: 0 };
-  // Índice estatístico de não-perda até G2; não é probabilidade garantida.
-  const prior = 0.75;
-  const btRate = bayesianRate(p.w, p.n, prior, 10);
-  const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status) && x.status !== 'EXPIRADO' && x.status !== 'CANCELADO');
-  const liveW = live.filter((x) => x.status !== 'LOSS').length;
-  const combined = live.length >= 5 ? bayesianRate(liveW, live.length, btRate, 10) : btRate;
-  return Math.round(combined * 100);
+  const p = ctx.stats.per[cand.key] || { n: 0, w: 0, trainN: 0, trainNonLoss: 0, validationN: 0, validationNonLoss: 0 };
+  // Índice de não-perda recente até G2, suavizado pelo período de treino.
+  // É um índice histórico, não uma probabilidade garantida.
+  const prior = p.trainN > 0 ? bayesianRate(p.trainNonLoss, p.trainN, 0.75, 10) : 0.75;
+  const recent = bayesianRate(p.validationNonLoss || 0, p.validationN || 0, prior, 8);
+  return Math.round(recent * 100);
 }
 
 /* ============================ SUSPENSÃO (persistente) ============================ */
@@ -1016,7 +1129,7 @@ function isSuspended(key) {
 }
 function maybeSuspend(key) {
   const recent = S.signals
-    .filter((x) => x.key === key && FECHADOS.has(x.status) && x.status !== 'EXPIRADO')
+    .filter((x) => x.key === key && FECHADOS.has(x.status) && x.status !== 'EXPIRADO' && x.status !== 'CANCELADO')
     .sort((a, b) => (a.t || 0) - (b.t || 0))
     .slice(-CFG.suspendLossStreak);
   if (recent.length < CFG.suspendLossStreak) return;
@@ -1030,7 +1143,7 @@ function maybeSuspend(key) {
 /* ============================ ESCADA DE OPORTUNIDADES ============================ */
 /* Tier 0/1/2: mesma exigência estatística; o tempo sem sinal nunca relaxa filtros
    Tier 2 (>5min): mantém os mesmos filtros; pode não emitir sinal
-   v21.6: TODOS os tiers mantêm os mesmos filtros rigorosos; nunca força sinal. */
+   v21.8: TODOS os tiers mantêm os mesmos filtros rigorosos; nunca força sinal. */
 
 function idleMs() { return S.lastSignalAt ? Date.now() - S.lastSignalAt : Infinity; }
 function tierAtual() {
@@ -1045,7 +1158,7 @@ function tierAtual() {
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
 function podeGerar() {
-  // v21.6: nunca gerar sinal usando cache após uma falha de sincronização/API.
+  // v21.8: nunca gerar sinal usando cache após uma falha de sincronização/API.
   if (R.apiBlocked || R.erroDB) { R.ultimoMotivo = 'API/BD sem sincronização e persistência válidas; sinais bloqueados'; return false; }
   if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return false; }
   if (pendentes().length >= CFG.maxPending) { R.ultimoMotivo = 'max pending'; return false; }
@@ -1079,10 +1192,9 @@ function podeGerar() {
 
 function stratSamples(key, stats) {
   const p = stats.per[key];
-  const bn = p ? p.n : 0;
-  let liveN = 0;
-  for (const x of S.signals) if (x.key === key && x.status !== 'PENDENTE' && x.status !== 'EXPIRADO' && x.status !== 'CANCELADO') liveN++;
-  return bn + liveN;
+  // O backtest percorre o histórico da mesa; não voltar a somar os sinais
+  // reais, porque isso duplicaria observações já presentes nas mesmas rodadas.
+  return p ? p.n : 0;
 }
 function liveHitRate(key) {
   let n = 0, w = 0;
@@ -1092,16 +1204,19 @@ function liveHitRate(key) {
   }
   return n >= 5 ? w / n : null;
 }
+function validationSamples(key, stats) {
+  const p = stats.per[key];
+  return p ? p.validationN || 0 : 0;
+}
 function directG1Rate(key, stats) {
-  const p = stats.per[key] || { n: 0, direct: 0, g1: 0 };
-  let n = p.n || 0;
-  let wins = (p.direct || 0) + (p.g1 || 0);
-  for (const x of S.signals) {
-    if (x.key !== key || !FECHADOS.has(x.status) || x.status === 'EXPIRADO' || x.status === 'CANCELADO') continue;
-    n++;
-    if (x.status === 'GREEN' || x.status === 'G1') wins++;
-  }
+  const p = stats.per[key] || { validationN: 0, validationDirect: 0, validationG1: 0 };
+  const n = p.validationN || 0;
+  const wins = (p.validationDirect || 0) + (p.validationG1 || 0);
   return n ? wins / n : 0;
+}
+function validationLossRate(key, stats) {
+  const p = stats.per[key] || { validationN: 0, validationLoss: 0 };
+  return p.validationN ? (p.validationLoss || 0) / p.validationN : 1;
 }
 
 /* ============================ GERAR SINAL ============================ */
@@ -1125,8 +1240,16 @@ async function tentarSinal() {
 
   cands = cands.filter((c) => {
     if (isSuspended(c.key)) return false;
-    if (stratSamples(c.key, stats) < T.minStratN) return false;
-    if (directG1Rate(c.key, stats) < CFG.minDirectG1Rate) return false;
+    const rule = STRATEGY_RULES[c.key] || {
+      minN: T.minStratN, minValidationN: 10,
+      minDirectG1: CFG.minDirectG1Rate, maxValidationLoss: 0.15
+    };
+    const requiredN = Math.max(T.minStratN, rule.minN);
+    const requiredFastRate = Math.max(CFG.minDirectG1Rate, rule.minDirectG1);
+    if (stratSamples(c.key, stats) < requiredN) return false;
+    if (validationSamples(c.key, stats) < rule.minValidationN) return false;
+    if (directG1Rate(c.key, stats) < requiredFastRate) return false;
+    if (validationLossRate(c.key, stats) > rule.maxValidationLoss) return false;
     const lr = liveHitRate(c.key);
     if (lr !== null && lr < T.liveMin) return false;
     return true;
@@ -1142,10 +1265,14 @@ async function tentarSinal() {
   let melhor = null;
   for (const cor of Object.keys(byColor)) {
     const list = byColor[cor];
-    const scored = list.map((c) => ({ ...c, conf: confianca(c, { stats, regime, agreement: { confirmations: list.length } }) }));
-    scored.sort((a, b) => b.conf - a.conf);
+    const scored = list.map((c) => {
+      const fastRate = directG1Rate(c.key, stats); // GREEN direto + G1 na janela de validação
+      const conf = confianca(c, { stats, regime, agreement: { confirmations: list.length } });
+      return { ...c, conf, fastRate, rankScore: fastRate * 0.70 + (conf / 100) * 0.30 };
+    });
+    scored.sort((a, b) => b.rankScore - a.rankScore || b.fastRate - a.fastRate || b.conf - a.conf);
     const top = scored[0];
-    if (!melhor || top.conf > melhor.conf) melhor = { ...top, agree: scored.length };
+    if (!melhor || top.rankScore > melhor.rankScore) melhor = { ...top, agree: scored.length };
   }
 
   if (!melhor) { R.ultimoMotivo = 'sem candidato'; return; }
@@ -1309,6 +1436,16 @@ function currentSyncMs() {
 
 async function sync() {
   const apiEstavaBloqueada = R.apiBlocked;
+  const now = Date.now();
+  const todasFontesEmCooldown = API_SOURCE_STATE.length > 0 &&
+    API_SOURCE_STATE.every((state) => state.blockedUntil > now);
+  if (todasFontesEmCooldown) {
+    R.apiBlocked = true;
+    R.erroAPI = API_SOURCE_STATE.map((state, i) =>
+      `fonte${i + 1}: limite 429; em espera ${Math.ceil((state.blockedUntil - now) / 1000)}s`
+    ).join(' | ');
+    return; // sem chamadas HTTP nem logs repetidos durante o cooldown
+  }
   try {
     const rounds = await fetchRounds();
     let novos = 0, atualizados = 0;
@@ -1330,6 +1467,8 @@ async function sync() {
     S.hist = [...byId.values()].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
     if (S.hist.length > CFG.maxHist) S.hist = S.hist.slice(-CFG.maxHist);
     S.seen = new Set(S.hist.map((r) => r.id));
+    // Se a API corrigiu uma rodada já conhecida, invalidar o backtest em cache.
+    if (atualizados > 0) { S.stats = null; S.statsAtLen = -1; }
     // Confirma a ligação em cada sincronização; regrava estado auxiliar apenas após falha anterior.
     const recuperarEstadoDB = Boolean(R.erroDB);
     if (!(await dbPing())) throw new Error('PostgreSQL indisponível durante a sincronização');
@@ -1340,6 +1479,8 @@ async function sync() {
     }
     R.erroDB = null;
     R.apiBlocked = false;
+    lastSyncErrorSignature = '';
+    lastSyncErrorLogAt = 0;
     R.ultimaSync = new Date().toISOString();
     const newest = S.hist[S.hist.length - 1];
     if (newest) R.ultimaRodadaNova = new Date(newest.t).toISOString();
@@ -1377,23 +1518,32 @@ async function sync() {
     if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length, fonte: R.fonteAPI + 1, retoma: S.awaitingRecovery });
 
   } catch (e) {
-    // v21.6: falha de API/429 suspende sinais imediatamente, mesmo com cache recente.
+    // v21.8: falha de API/429 suspende sinais imediatamente, mesmo com cache recente.
     R.apiBlocked = true;
     S.awaitingRecovery = Math.max(S.awaitingRecovery, CFG.recoveryRounds);
     R.erroAPI = e.message;
-    log('SYNC ERRO', e.message);
+    const signature = String(e.message || 'erro API');
+    if (signature !== lastSyncErrorSignature || Date.now() - lastSyncErrorLogAt >= 60000) {
+      log('SYNC ERRO', signature);
+      lastSyncErrorSignature = signature;
+      lastSyncErrorLogAt = Date.now();
+    }
     await tgAlert('API', `Erro ao consultar API BACBO:\n<code>${e.message}</code>`);
   }
 }
 
 let lastSyncAt = 0;
+let lastSyncErrorSignature = '';
+let lastSyncErrorLogAt = 0;
 async function tick() {
   if (busy || stopping) return;
   busy = true; lastTickMs = Date.now();
   try {
     await checkDailyReset();
     const now = Date.now();
-    if (now - lastSyncAt >= currentSyncMs()) {
+    const todasFontesEmCooldown = API_SOURCE_STATE.length > 0 &&
+      API_SOURCE_STATE.every((state) => state.blockedUntil > now);
+    if (!todasFontesEmCooldown && now - lastSyncAt >= currentSyncMs()) {
       await sync();
       lastSyncAt = Date.now();
     }
@@ -1436,11 +1586,19 @@ app.get('/health', (req, res) => {
   res.json({
     ok: Boolean(server) && leaderReady && !R.erroDB && !R.apiBlocked,
     role: leaderReady ? 'leader' : 'standby',
-    versao: '21.6', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    versao: '21.8', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     dadosStale: R.dadosStale,
     apiBlocked: R.apiBlocked,
+    apiFontes: API_SOURCE_STATE.map((state, i) => ({
+      fonte: i + 1,
+      bloqueada: state.blockedUntil > Date.now(),
+      esperaSeg: Math.max(0, Math.ceil((state.blockedUntil - Date.now()) / 1000)),
+      falhas429: state.failures429,
+      ultimoErro: state.lastError,
+      ultimaRespostaOK: state.lastSuccessAt ? new Date(state.lastSuccessAt).toISOString() : null
+    })),
     aguardaRetoma: S.awaitingRecovery,
     rodasRetoma: CFG.recoveryRounds,
     diario: { ...DAILY, taxa: dailyTaxa() }, geral: ALLTIME,
@@ -1451,7 +1609,7 @@ app.get('/health', (req, res) => {
   });
 });
 app.get('/status', requireAdmin, (req, res) => {
-  res.json({ motivo: R.ultimoMotivo, R, DAILY, ALLTIME, CFG, suspenso: Object.keys(SUSPENDED) });
+  res.json({ motivo: R.ultimoMotivo, R, DAILY, ALLTIME, CFG, estrategiasAtivas: [...ACTIVE_STRATEGIES], regrasEstrategias: STRATEGY_RULES, suspenso: Object.keys(SUSPENDED) });
 });
 app.get('/sinais', requireAdmin, async (req, res) => {
   const n = Math.min(500, Math.max(1, parseInt(req.query.n, 10) || 50));
@@ -1515,6 +1673,8 @@ async function becomeLeader() {
     // consultar a API, apurar sinais ou enviar mensagens.
     await dbLoadState();
     if (R.erroDB) throw new Error(`PostgreSQL não carregou o estado: ${R.erroDB}`);
+    await restoreApiCooldown();
+    if (R.erroDB) throw new Error(`PostgreSQL não recuperou o cooldown da API: ${R.erroDB}`);
     await dbLoadAlltime();
     if (R.erroDB) throw new Error(`PostgreSQL não carregou estatísticas: ${R.erroDB}`);
     await sync();
@@ -1563,7 +1723,7 @@ async function start() {
     throw new Error('DATABASE_URL inválido');
   }
 
-  log('BOOT', { versao: '21.6', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  log('BOOT', { versao: '21.8', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
