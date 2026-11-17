@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v21.4
+ * CAPUNGA DADOS — BAC BO · v21.5
  *
  * ALTERAÇÕES v20 (vs v19) — baseadas na auditoria do histórico real:
  *  1. GATE DE FRESQUIDÃO: se a última rodada recebida tiver mais de maxStaleMs
@@ -114,7 +114,7 @@ const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, l
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.4',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.5',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
@@ -164,7 +164,12 @@ async function dbInit() {
         tipo TEXT NOT NULL, conf INT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDENTE',
         gale INT, agree INT, tier INT DEFAULT 0, trigger_round_id TEXT, created_at TIMESTAMPTZ NOT NULL, closed_at TIMESTAMPTZ
       );
+      -- Migração compatível: atualiza tabelas antigas sem apagar histórico.
+      ALTER TABLE capunga_signals_v20 ADD COLUMN IF NOT EXISTS gale INT;
+      ALTER TABLE capunga_signals_v20 ADD COLUMN IF NOT EXISTS agree INT DEFAULT 1;
+      ALTER TABLE capunga_signals_v20 ADD COLUMN IF NOT EXISTS tier INT DEFAULT 0;
       ALTER TABLE capunga_signals_v20 ADD COLUMN IF NOT EXISTS trigger_round_id TEXT;
+      ALTER TABLE capunga_signals_v20 ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
       CREATE INDEX IF NOT EXISTS idx_cap_sig_status ON capunga_signals_v20(status);
       CREATE INDEX IF NOT EXISTS idx_cap_sig_created ON capunga_signals_v20(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_cap_sig_trigger ON capunga_signals_v20(trigger_round_id);
@@ -998,7 +1003,7 @@ function tierAtual() {
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
 function podeGerar() {
-  // v21.4: nunca gerar sinal usando cache após uma falha de sincronização/API.
+  // v21.5: nunca gerar sinal usando cache após uma falha de sincronização/API.
   if (R.apiBlocked) { R.ultimoMotivo = 'API sem sincronização válida; sinais bloqueados'; return false; }
   if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return false; }
   if (pendentes().length >= CFG.maxPending) { R.ultimoMotivo = 'max pending'; return false; }
@@ -1288,7 +1293,7 @@ async function sync() {
     if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length, fonte: R.fonteAPI + 1, retoma: S.awaitingRecovery });
 
   } catch (e) {
-    // v21.4: falha de API/429 suspende sinais imediatamente, mesmo com cache recente.
+    // v21.5: falha de API/429 suspende sinais imediatamente, mesmo com cache recente.
     R.apiBlocked = true;
     S.awaitingRecovery = Math.max(S.awaitingRecovery, CFG.recoveryRounds);
     R.erroAPI = e.message;
@@ -1347,7 +1352,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: Boolean(server) && !R.erroDB,
     role: leaderReady ? 'leader' : 'standby',
-    versao: '21.4', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    versao: '21.5', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     dadosStale: R.dadosStale,
@@ -1472,7 +1477,7 @@ async function start() {
     throw new Error('DATABASE_URL inválido');
   }
 
-  log('BOOT', { versao: '21.4', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  log('BOOT', { versao: '21.5', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
