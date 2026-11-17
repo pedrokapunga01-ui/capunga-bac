@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * CAPUNGA DADOS — BAC BO · v21.5
+ * CAPUNGA DADOS — BAC BO · v21.6
  *
  * ALTERAÇÕES v20 (vs v19) — baseadas na auditoria do histórico real:
  *  1. GATE DE FRESQUIDÃO: se a última rodada recebida tiver mais de maxStaleMs
@@ -49,7 +49,7 @@ const CFG = {
   api429MaxMs: 180000,        // limite do backoff exponencial (3 min)
   minGapMs: 20000,            // entre sinais (quando há oportunidade)
   relaxMs: 3 * 60 * 1000,     // 3min sem sinal -> relaxa os filtros
-  forceSignalMs: 5 * 60 * 1000, // 5min -> melhor oportunidade disponível (SÓ com dados frescos)
+  forceSignalMs: 5 * 60 * 1000, // apenas muda o tier; nunca força sinal
   minSettledAgeMs: 5000,
   apuraMaxMs: 600000,
   maxHist: 4000,
@@ -68,11 +68,12 @@ const CFG = {
   confMax: 95,
   baseRateMin: 0.60,          // limites do base rate do backtest (sem clamp de 0.90)
   baseRateMax: 0.95,
-  // Escada de rigor por tier (0=rigoroso, 1=relaxado, 2=melhor disponível)
+  minDirectG1Rate: 0.60, // prioriza GREEN direto + G1; G2 não conta para este filtro
+  // Todos os tiers usam os mesmos limites; o tempo sem sinal não reduz o rigor.
   tiers: [
-    { scoreMin: 84, minStratN: 8, liveMin: 0.80 },
-    { scoreMin: 80, minStratN: 5, liveMin: 0.72 },
-    { scoreMin: 76, minStratN: 3, liveMin: 0 }
+    { scoreMin: 84, minStratN: 20, liveMin: 0.85 },
+    { scoreMin: 84, minStratN: 20, liveMin: 0.85 },
+    { scoreMin: 84, minStratN: 20, liveMin: 0.85 }
   ]
 };
 
@@ -81,7 +82,7 @@ const B = 'Banca';
 const E = 'Empate';
 const isCol = (x) => x === J || x === B;
 const opp = (c) => (c === J ? B : c === B ? J : null);
-const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS', 'EXPIRADO']);
+const FECHADOS = new Set(['GREEN', 'G1', 'G2', 'EMPATE', 'EG1', 'EG2', 'LOSS', 'EXPIRADO', 'CANCELADO']);
 const LOCK_KEY = Number(process.env.LOCK_KEY || 727272);
 
 const API_SOURCES = [
@@ -114,7 +115,7 @@ const ALLTIME = { total: 0, green: 0, g1: 0, g2: 0, empate: 0, eg1: 0, eg2: 0, l
 const SUSPENDED = {};
 
 const R = {
-  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.5',
+  iniciadoEm: new Date().toISOString(), deployId: DEPLOY_ID, versao: '21.6',
   ultimaSync: null, ultimaRodadaNova: null, fonteAPI: 0,
   erroAPI: null, erroTelegram: null, erroDB: null,
   ultimoMotivo: null, ultimoSinal: null, tier: 0, wakes: 0, ultimoWake: null,
@@ -220,17 +221,45 @@ async function dbStateGet(k) {
   catch (e) { R.erroDB = e.message; return null; }
 }
 async function dbStateSet(k, v) {
-  if (!pool) return;
+  if (!pool) { R.apiBlocked = true; R.erroDB = 'PostgreSQL indisponível'; return false; }
   try {
     await pool.query(
       `INSERT INTO capunga_state(k,v,updated_at) VALUES ($1,$2,NOW())
        ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()`,
       [k, String(v)]
     );
-  } catch (e) { R.erroDB = e.message; }
+    return true;
+  } catch (e) { R.erroDB = e.message; R.apiBlocked = true; log('DB WRITE ERRO', e.message); return false; }
 }
+async function dbCreateSignalAtomic(s, nextId) {
+  if (!pool) { R.apiBlocked = true; R.erroDB = 'PostgreSQL indisponível'; return false; }
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const inserted = await client.query(
+      `INSERT INTO capunga_signals_v20 (id,cor,key,nome,tipo,conf,status,gale,agree,tier,trigger_round_id,created_at,closed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO NOTHING`,
+      [s.id, s.cor, s.key, s.nome, s.tipo, s.conf, s.status, s.gale ?? null, s.agree ?? 1, s.tier ?? 0,
+       s.triggerRoundId || null, new Date(s.t), s.fechadoEm ? new Date(s.fechadoEm) : null]
+    );
+    if (inserted.rowCount !== 1) throw new Error(`ID de sinal ${s.id} já existe; envio cancelado`);
+    await client.query(
+      `INSERT INTO capunga_state(k,v,updated_at) VALUES ('nextId_v20',$1,NOW())
+       ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v, updated_at=NOW()`, [String(nextId)]
+    );
+    await client.query('COMMIT');
+    return true;
+  } catch (e) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    R.erroDB = e.message; R.apiBlocked = true;
+    log('DB WRITE ERRO', e.message);
+    return false;
+  } finally { if (client) client.release(); }
+}
+
 async function dbSignalInsert(s) {
-  if (!pool) return;
+  if (!pool) { R.apiBlocked = true; R.erroDB = 'PostgreSQL indisponível'; return false; }
   try {
     await pool.query(
       `INSERT INTO capunga_signals_v20 (id,cor,key,nome,tipo,conf,status,gale,agree,tier,trigger_round_id,created_at,closed_at)
@@ -238,24 +267,34 @@ async function dbSignalInsert(s) {
       [s.id, s.cor, s.key, s.nome, s.tipo, s.conf, s.status, s.gale ?? null, s.agree ?? 1, s.tier ?? 0,
        s.triggerRoundId || null, new Date(s.t), s.fechadoEm ? new Date(s.fechadoEm) : null]
     );
-  } catch (e) { R.erroDB = e.message; }
+    return true;
+  } catch (e) { R.erroDB = e.message; R.apiBlocked = true; log('DB WRITE ERRO', e.message); return false; }
 }
 async function dbSignalUpdate(s) {
-  if (!pool) return;
+  if (!pool) { R.apiBlocked = true; R.erroDB = 'PostgreSQL indisponível'; return false; }
   try {
-    await pool.query('UPDATE capunga_signals_v20 SET status=$1, gale=$2, closed_at=$3 WHERE id=$4',
+    const r = await pool.query('UPDATE capunga_signals_v20 SET status=$1, gale=$2, closed_at=$3 WHERE id=$4',
       [s.status, s.gale ?? null, s.fechadoEm ? new Date(s.fechadoEm) : null, s.id]);
-  } catch (e) { R.erroDB = e.message; }
+    if (r.rowCount !== 1) throw new Error(`sinal ${s.id} não encontrado para atualização`);
+    return true;
+  } catch (e) { R.erroDB = e.message; R.apiBlocked = true; log('DB WRITE ERRO', e.message); return false; }
 }
+async function dbPing() {
+  if (!pool) { R.erroDB = 'PostgreSQL indisponível'; return false; }
+  try { await pool.query('SELECT 1'); return true; }
+  catch (e) { R.erroDB = e.message; return false; }
+}
+
 async function dbRoundUpsert(r) {
-  if (!pool) return;
+  if (!pool) { R.apiBlocked = true; R.erroDB = 'PostgreSQL indisponível'; return false; }
   try {
     await pool.query(
       `INSERT INTO capunga_rounds(id,resultado,t,pj,pb) VALUES($1,$2,$3,$4,$5)
        ON CONFLICT(id) DO UPDATE SET resultado=EXCLUDED.resultado,t=EXCLUDED.t,pj=EXCLUDED.pj,pb=EXCLUDED.pb`,
       [r.id, r.resultado, r.t, r.pj, r.pb]
     );
-  } catch (e) { R.erroDB = e.message; }
+    return true;
+  } catch (e) { R.erroDB = e.message; R.apiBlocked = true; log('DB WRITE ERRO', e.message); return false; }
 }
 
 async function dbLoadAlltime() {
@@ -264,7 +303,7 @@ async function dbLoadAlltime() {
     // Placar geral inclui todos os estados fechados, inclusive expirados (separados nas taxas).
     const r = await pool.query(
       `SELECT status, COUNT(*)::int AS n FROM capunga_signals_v20
-       WHERE status <> 'PENDENTE' GROUP BY status`
+       WHERE status NOT IN ('PENDENTE','CANCELADO') GROUP BY status`
     );
     for (const k of Object.keys(ALLTIME)) ALLTIME[k] = 0;
     for (const row of r.rows) {
@@ -328,11 +367,16 @@ async function dbLoadState() {
       triggerRoundId: row.trigger_round_id || null,
       gale1MsgId: null, gale2MsgId: null, galeLevel: row.status !== 'PENDENTE' ? 2 : 0
     }));
-    if (!S.lastSignalRoundId) {
-      const lastWithRound = [...S.signals].reverse().find((x) => x.triggerRoundId);
-      if (lastWithRound) S.lastSignalRoundId = lastWithRound.triggerRoundId;
+    const lastRealSignal = [...S.signals].reverse().find((x) => x.status !== 'CANCELADO');
+    if (lastRealSignal) {
+      S.lastSignalAt = Math.max(S.lastSignalAt || 0, lastRealSignal.t || 0);
+      if (!S.lastSignalRoundId || (lastRealSignal.t || 0) >= S.lastSignalAt) {
+        if (lastRealSignal.triggerRoundId) S.lastSignalRoundId = lastRealSignal.triggerRoundId;
+      }
     }
+    if (R.erroDB) throw new Error(`falha ao carregar estado PostgreSQL: ${R.erroDB}`);
     await dbLoadAlltime();
+    if (R.erroDB) throw new Error(`falha ao carregar estatísticas PostgreSQL: ${R.erroDB}`);
     log('DB', `estado carregado: nextId=${S.nextId}, sinais=${S.signals.length}, diário=${DAILY.date}`);
 
   } catch (e) { R.erroDB = e.message; log('DB ERRO load', e.message); }
@@ -435,7 +479,7 @@ function fmtSinal(s) {
   return [
     '🎯 <b>CAPUNGA PRIME</b>',
     `${emojiCor(s.cor)} <b>ENTRADA: ${s.cor === J ? 'AZUL' : 'VERMELHO'}</b>`,
-    `${confEmoji} Força: <b>${s.conf}%</b>`,
+    `${confEmoji} Índice: <b>${s.conf}%</b>`,
     `🧠 Padrão: ${s.emoji || '🧩'} ${s.nome}`,
     '🛡️ Proteção: Empate',
     `⏰ ${hora(s.t || Date.now())}`
@@ -537,7 +581,7 @@ function retryAfterMs(error) {
 async function fetchFrom(url) {
   const resp = await axios.get(url, {
     timeout: 10000,
-    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/21.4' }
+    headers: { Accept: 'application/json', 'User-Agent': 'CapungaDados/21.6' }
   });
   const map = new Map();
   for (const it of extractItems(resp.data)) {
@@ -641,7 +685,7 @@ function detectRegime(seq) {
 function regimeFit(cand, regime) {
   const k = cand.key;
   if (/SEQ_(QUEBRA|SURF|PINGPONG|2x2|EXTEND|3_1|MOMENTUM|ALT|BREAK_WEAK)/.test(k)) return regime.chop >= 0.45;
-  if (/SEQ_(REP|STRONG_STREAK)|BANKER_BIAS/.test(k)) return regime.trend >= 0.45;
+  if (/SEQ_(REP|STRONG_STREAK)|(BANKER|PLAYER)_BIAS/.test(k)) return regime.trend >= 0.45;
   return true;
 }
 
@@ -725,7 +769,7 @@ const STRATS = [
     const b = s.filter((r) => r.resultado === B).length;
     const j = s.filter((r) => r.resultado === J).length;
     if (b >= 12) return { cor: B, key: 'BANKER_BIAS_20', nome: 'Viés Banca', emoji: '📉', strength: 80, tipo: 'seq' };
-    if (j >= 12) return { cor: J, key: 'BANKER_BIAS_20', nome: 'Viés Jogador', emoji: '📈', strength: 80, tipo: 'seq' };
+    if (j >= 12) return { cor: J, key: 'PLAYER_BIAS_20', nome: 'Viés Jogador', emoji: '📈', strength: 80, tipo: 'seq' };
     return null;
   },
   // ---- NUMÉRICA (força real dos dados: margens, escores, sequências de pontos) ----
@@ -866,12 +910,21 @@ const STRATS = [
   }
 ];
 
+// v21.6: apenas padrões que tiveram melhor resultado no histórico auditado.
+// Os restantes continuam no código para auditoria/backtest, mas não podem emitir sinais.
+const ACTIVE_STRATEGIES = new Set([
+  'PLAYER_BIAS_20',  // Viés Jogador: n=94, loss histórico 5,3%; Viés Banca excluído
+  'SEQ_2x2',         // Bloco 2+2: n=111, loss histórico 6,3%
+  'SEQ_ALT_STRONG',  // Alternância forte: n=32, loss histórico 6,2%
+  'NUM_DOUBLE_HIGH'  // Dupla margem alta: n=25, loss histórico 4,0%
+]);
+
 function runStrategies(rows) {
   const seq = rows.filter((r) => isCol(r.resultado));
   const ctx = { rows, seq };
   const out = [];
   for (const fn of STRATS) {
-    try { const r = fn(ctx); if (r && isCol(r.cor)) out.push(r); } catch (_) {}
+    try { const r = fn(ctx); if (r && isCol(r.cor) && ACTIVE_STRATEGIES.has(r.key)) out.push(r); } catch (_) {}
   }
   return out;
 }
@@ -893,9 +946,10 @@ function evalEntry(H, i, cor) {
     const idx = i + k;
     if (idx >= H.length) return null;
     if (H[idx].t - H[idx - 1].t > CFG.gapMs) return null; // dados interrompidos: sem julgamento
-    if (H[idx].resultado === cor || H[idx].resultado === E) return true;
+    if (H[idx].resultado === cor) return k === 1 ? 'GREEN' : k === 2 ? 'G1' : 'G2';
+    if (H[idx].resultado === E) return k === 1 ? 'EMPATE' : k === 2 ? 'EG1' : 'EG2';
   }
-  return false;
+  return 'LOSS';
 }
 function backtest() {
   const H = S.hist;
@@ -909,9 +963,14 @@ function backtest() {
     for (const c of runStrategies(win)) {
       const v = evalEntry(H, i, c.cor);
       if (v === null) continue;
-      const p = per[c.key] || (per[c.key] = { n: 0, w: 0 });
-      p.n++; if (v) p.w++;
-      bn++; if (v) bw++;
+      const p = per[c.key] || (per[c.key] = { n: 0, w: 0, direct: 0, g1: 0, g2: 0, draws: 0, loss: 0 });
+      p.n++;
+      if (v !== 'LOSS') { p.w++; bn++; bw++; } else { bn++; }
+      if (v === 'GREEN') p.direct++;
+      else if (v === 'G1') p.g1++;
+      else if (v === 'G2') p.g2++;
+      else if (v === 'EMPATE' || v === 'EG1' || v === 'EG2') p.draws++;
+      else if (v === 'LOSS') p.loss++;
     }
   }
   // v20: prior neutro 0.85 (≈ 1 - 0.5^3 de acertar numa cor em 3 rodadas),
@@ -927,7 +986,7 @@ function getStats(force = false) {
   return S.stats;
 }
 
-/* ============================ CONFIANÇA (v20: honesta) ============================
+/* ============================ ÍNDICE ESTATÍSTICO (v21.6) ============================
  * conf = taxa histórica de NÃO PERDER até G2 (green, gale ou empate/devolução).
  * Prior do backtest + amostra real, SEM piso fabricado de 80.
  * Um número alto aqui não é garantia: é o histórico observado dessa estratégia. */
@@ -938,29 +997,13 @@ function bayesianRate(w, n, priorRate, priorWeight) {
 function confianca(cand, ctx) {
   const stats = ctx.stats;
   const p = stats.per[cand.key] || { n: 0, w: 0 };
-  const baseRate = stats.baseRate || 0.85;
-  const btRate = bayesianRate(p.w, p.n, baseRate, 6);
-  // amostra real: EXPIRADO não julga a estratégia, fica de fora
-  const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status) && x.status !== 'EXPIRADO');
+  // Índice estatístico de não-perda até G2; não é probabilidade garantida.
+  const prior = 0.75;
+  const btRate = bayesianRate(p.w, p.n, prior, 10);
+  const live = S.signals.filter((x) => x.key === cand.key && FECHADOS.has(x.status) && x.status !== 'EXPIRADO' && x.status !== 'CANCELADO');
   const liveW = live.filter((x) => x.status !== 'LOSS').length;
-  const liveRate = live.length >= 5 ? bayesianRate(liveW, live.length, btRate, 5) : null;
-
-  let conf = Math.round((liveRate ?? btRate) * 100);
-
-  const agree = ctx.agreement?.confirmations || 0;
-  conf += agree >= 3 ? 2 : agree >= 2 ? 1 : 0;
-  conf += Math.round((cand.strength - 80) * 0.15);
-  if (cand.tipo === 'seq' && ctx.regime) {
-    const regimeMatch = (cand.key.includes('QUEBRA') || cand.key.includes('SURF') || cand.key.includes('PINGPONG'))
-      ? ctx.regime.chop : ctx.regime.trend;
-    conf += Math.round((regimeMatch - 0.5) * 4);
-  }
-  if (live.length >= 5 && liveW / live.length < 0.80) conf -= 4;
-  const recentLoss = S.signals.find((x) =>
-    x.key === cand.key && x.status === 'LOSS' && Date.now() - (x.fechadoEm || 0) < 5 * 60 * 1000);
-  if (recentLoss) conf -= 3;
-
-  return Math.max(CFG.confMin, Math.min(CFG.confMax, conf));
+  const combined = live.length >= 5 ? bayesianRate(liveW, live.length, btRate, 10) : btRate;
+  return Math.round(combined * 100);
 }
 
 /* ============================ SUSPENSÃO (persistente) ============================ */
@@ -985,10 +1028,9 @@ function maybeSuspend(key) {
 }
 
 /* ============================ ESCADA DE OPORTUNIDADES ============================ */
-/* Tier 0 (mesa quente, <3min sem sinal): RIGOROSO — só entrada de alta convicção
-   Tier 1 (3-5min): RELAXADO — filtros cedem um pouco
-   Tier 2 (>5min): melhor oportunidade disponível
-   v20: TODOS os tiers exigem dados frescos (maxStaleMs) e retoma confirmada. */
+/* Tier 0/1/2: mesma exigência estatística; o tempo sem sinal nunca relaxa filtros
+   Tier 2 (>5min): mantém os mesmos filtros; pode não emitir sinal
+   v21.6: TODOS os tiers mantêm os mesmos filtros rigorosos; nunca força sinal. */
 
 function idleMs() { return S.lastSignalAt ? Date.now() - S.lastSignalAt : Infinity; }
 function tierAtual() {
@@ -1003,8 +1045,8 @@ function tierAtual() {
 function pendentes() { return S.signals.filter((s) => !FECHADOS.has(s.status)); }
 
 function podeGerar() {
-  // v21.5: nunca gerar sinal usando cache após uma falha de sincronização/API.
-  if (R.apiBlocked) { R.ultimoMotivo = 'API sem sincronização válida; sinais bloqueados'; return false; }
+  // v21.6: nunca gerar sinal usando cache após uma falha de sincronização/API.
+  if (R.apiBlocked || R.erroDB) { R.ultimoMotivo = 'API/BD sem sincronização e persistência válidas; sinais bloqueados'; return false; }
   if (!CFG.ativos) { R.ultimoMotivo = 'desativado'; return false; }
   if (pendentes().length >= CFG.maxPending) { R.ultimoMotivo = 'max pending'; return false; }
   const now = Date.now();
@@ -1039,16 +1081,27 @@ function stratSamples(key, stats) {
   const p = stats.per[key];
   const bn = p ? p.n : 0;
   let liveN = 0;
-  for (const x of S.signals) if (x.key === key && x.status !== 'PENDENTE' && x.status !== 'EXPIRADO') liveN++;
+  for (const x of S.signals) if (x.key === key && x.status !== 'PENDENTE' && x.status !== 'EXPIRADO' && x.status !== 'CANCELADO') liveN++;
   return bn + liveN;
 }
 function liveHitRate(key) {
   let n = 0, w = 0;
   for (const x of S.signals) {
-    if (x.key !== key || x.status === 'PENDENTE' || x.status === 'EXPIRADO') continue;
+    if (x.key !== key || x.status === 'PENDENTE' || x.status === 'EXPIRADO' || x.status === 'CANCELADO') continue;
     n++; if (x.status !== 'LOSS') w++;
   }
   return n >= 5 ? w / n : null;
+}
+function directG1Rate(key, stats) {
+  const p = stats.per[key] || { n: 0, direct: 0, g1: 0 };
+  let n = p.n || 0;
+  let wins = (p.direct || 0) + (p.g1 || 0);
+  for (const x of S.signals) {
+    if (x.key !== key || !FECHADOS.has(x.status) || x.status === 'EXPIRADO' || x.status === 'CANCELADO') continue;
+    n++;
+    if (x.status === 'GREEN' || x.status === 'G1') wins++;
+  }
+  return n ? wins / n : 0;
 }
 
 /* ============================ GERAR SINAL ============================ */
@@ -1068,11 +1121,12 @@ async function tentarSinal() {
   let cands = runStrategies(rows);
   if (!cands.length) { R.ultimoMotivo = 'sem estratégia'; return; }
 
-  if (tier <= 1) cands = cands.filter((c) => regimeFit(c, regime)); // tier 2 ignora regime (mas pega o melhor)
+  cands = cands.filter((c) => regimeFit(c, regime)); // todos os tiers respeitam o regime
 
   cands = cands.filter((c) => {
     if (isSuspended(c.key)) return false;
     if (stratSamples(c.key, stats) < T.minStratN) return false;
+    if (directG1Rate(c.key, stats) < CFG.minDirectG1Rate) return false;
     const lr = liveHitRate(c.key);
     if (lr !== null && lr < T.liveMin) return false;
     return true;
@@ -1109,25 +1163,39 @@ async function tentarSinal() {
 
   const analisando = await tgSendRaw(fmtAnalisando());
   try {
-    const envio = await tgSendRaw(fmtSinal(sinalPreliminar));
-    if (!envio.ok) {
-      log('SINAL', { motivo: 'telegram rejeitou sinal', id: reservedId });
-      R.ultimoMotivo = 'telegram falhou';
+    // Primeiro grava o sinal e o próximo ID numa transação. Nunca publicar um sinal sem registo durável.
+    const dbOk = await dbCreateSignalAtomic(sinalPreliminar, reservedId + 1);
+    if (!dbOk) {
+      R.ultimoMotivo = 'PostgreSQL indisponível; sinal não enviado';
+      await tgAlert('DB', 'Sinal bloqueado: não foi possível guardar o registo no PostgreSQL.');
       return;
     }
+    S.nextId = reservedId + 1; // reserva consumida, mesmo se o Telegram falhar
+
+    const envio = await tgSendRaw(fmtSinal(sinalPreliminar));
+    if (!envio.ok) {
+      sinalPreliminar.status = 'CANCELADO';
+      sinalPreliminar.fechadoEm = Date.now();
+      const cancelOk = await dbSignalUpdate(sinalPreliminar);
+      if (!cancelOk) R.apiBlocked = true;
+      R.ultimoMotivo = 'Telegram falhou; sinal cancelado no registo';
+      log('SINAL', { motivo: 'telegram rejeitou sinal', id: reservedId });
+      return;
+    }
+
     const agora = sinalPreliminar.t;
-    S.nextId++;
     S.lastSignalRoundId = sinalPreliminar.triggerRoundId;
+    S.lastSignalAt = agora;
+    const stateOk = await dbStateSet('lastSignalAt_v20', String(agora)) &&
+      await dbStateSet('lastSignalRoundId_v20', S.lastSignalRoundId);
+    if (!stateOk) {
+      R.apiBlocked = true;
+      await tgAlert('DB', 'O sinal foi enviado e guardado, mas o estado auxiliar falhou. Novos sinais ficam bloqueados até recuperação.');
+    }
     S.signals.push(sinalPreliminar);
     if (S.signals.length > CFG.maxSignalsMem) S.signals = S.signals.slice(-CFG.maxSignalsMem + 50);
-    S.lastSignalAt = agora;
     R.ultimoSinal = sinalPreliminar;
     R.ultimoMotivo = null;
-
-    await dbSignalInsert(sinalPreliminar);
-    await dbStateSet('nextId_v20', String(S.nextId));
-    await dbStateSet('lastSignalAt_v20', String(agora));
-    await dbStateSet('lastSignalRoundId_v20', S.lastSignalRoundId);
 
     log('SINAL', { id: sinalPreliminar.id, cor: sinalPreliminar.cor, conf: sinalPreliminar.conf, key: sinalPreliminar.key, tier });
 
@@ -1152,9 +1220,17 @@ async function notificarGale(s, nivel) {
 /* ============================ FECHAR ============================ */
 
 async function fecharSinal(s, status, gale) {
+  const anterior = { status: s.status, gale: s.gale, fechadoEm: s.fechadoEm };
   s.status = status;
   s.gale = gale;
   s.fechadoEm = Date.now();
+  if (!(await dbSignalUpdate(s))) {
+    s.status = anterior.status || 'PENDENTE';
+    s.gale = anterior.gale ?? null;
+    s.fechadoEm = anterior.fechadoEm ?? null;
+    R.ultimoMotivo = `BD indisponível; apuração do sinal ${s.id} será repetida`;
+    return false;
+  }
 
   if (s.gale1MsgId) { await tgDelete(s.gale1MsgId); s.gale1MsgId = null; }
   if (s.gale2MsgId) { await tgDelete(s.gale2MsgId); s.gale2MsgId = null; }
@@ -1174,7 +1250,6 @@ async function fecharSinal(s, status, gale) {
   await dbStateSet('curStreak_v20', String(S.curStreak));
   await dbStateSet('daily_v20', JSON.stringify(DAILY));
 
-  await dbSignalUpdate(s);
   await tgSendRaw(fmtResult(s));
   await tgSendRaw(fmtHistorico());
   if (status === 'LOSS') maybeSuspend(s.key);
@@ -1240,22 +1315,31 @@ async function sync() {
     const newestBefore = S.hist[S.hist.length - 1];
     const newestBeforeT = newestBefore ? newestBefore.t : 0;
     const wasStaleBefore = !newestBefore || Date.now() - newestBefore.t > CFG.maxStaleMs;
-    // Só desbloqueia depois de fetch válido e persistência das rodadas.
-    R.apiBlocked = false;
+    // Fail-closed: só desbloquear depois de persistir todas as rodadas recebidas.
     const byId = new Map(S.hist.map((r) => [r.id, r]));
     for (const r of rounds) {
       const previous = byId.get(r.id);
       if (!previous) {
         novos++; byId.set(r.id, r);
-        await dbRoundUpsert(r);
+        if (!(await dbRoundUpsert(r))) throw new Error('falha ao persistir nova rodada no PostgreSQL');
       } else if (previous.t !== r.t || previous.resultado !== r.resultado || previous.pj !== r.pj || previous.pb !== r.pb) {
+        if (!(await dbRoundUpsert(r))) throw new Error('falha ao persistir rodada atualizada no PostgreSQL');
         Object.assign(previous, r); atualizados++;
-        await dbRoundUpsert(r);
       }
     }
     S.hist = [...byId.values()].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id));
     if (S.hist.length > CFG.maxHist) S.hist = S.hist.slice(-CFG.maxHist);
     S.seen = new Set(S.hist.map((r) => r.id));
+    // Confirma a ligação em cada sincronização; regrava estado auxiliar apenas após falha anterior.
+    const recuperarEstadoDB = Boolean(R.erroDB);
+    if (!(await dbPing())) throw new Error('PostgreSQL indisponível durante a sincronização');
+    if (recuperarEstadoDB) {
+      if (!(await dbStateSet('daily_v20', JSON.stringify(DAILY)))) throw new Error('falha ao recuperar placar diário');
+      if (!(await dbStateSet('curStreak_v20', String(S.curStreak)))) throw new Error('falha ao recuperar sequência');
+      if (!(await dbStateSet('suspended_v20', JSON.stringify(Object.entries(SUSPENDED))))) throw new Error('falha ao recuperar suspensões');
+    }
+    R.erroDB = null;
+    R.apiBlocked = false;
     R.ultimaSync = new Date().toISOString();
     const newest = S.hist[S.hist.length - 1];
     if (newest) R.ultimaRodadaNova = new Date(newest.t).toISOString();
@@ -1293,7 +1377,7 @@ async function sync() {
     if (novos || atualizados) log('SYNC', { novos, atualizados, total: S.hist.length, fonte: R.fonteAPI + 1, retoma: S.awaitingRecovery });
 
   } catch (e) {
-    // v21.5: falha de API/429 suspende sinais imediatamente, mesmo com cache recente.
+    // v21.6: falha de API/429 suspende sinais imediatamente, mesmo com cache recente.
     R.apiBlocked = true;
     S.awaitingRecovery = Math.max(S.awaitingRecovery, CFG.recoveryRounds);
     R.erroAPI = e.message;
@@ -1350,9 +1434,9 @@ function requireAdmin(req, res, next) {
 app.get('/health', (req, res) => {
   const newest = S.hist[S.hist.length - 1];
   res.json({
-    ok: Boolean(server) && !R.erroDB,
+    ok: Boolean(server) && leaderReady && !R.erroDB && !R.apiBlocked,
     role: leaderReady ? 'leader' : 'standby',
-    versao: '21.5', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
+    versao: '21.6', deployId: DEPLOY_ID, maxGale: CFG.maxGale, lock: R.lockOk,
     tier: R.tier, fonteAPI: R.fonteAPI + 1, fontes: API_SOURCES.length,
     hist: S.hist.length, sinais: S.signals.length, pendentes: pendentes().length,
     dadosStale: R.dadosStale,
@@ -1410,7 +1494,7 @@ app.get('/stats', requireAdmin, (req, res) => {
 app.get('/calibracao', requireAdmin, (req, res) => {
   const buckets = { '50-69': { n: 0, w: 0 }, '70-79': { n: 0, w: 0 }, '80-85': { n: 0, w: 0 }, '86-92': { n: 0, w: 0 }, '93-95': { n: 0, w: 0 } };
   for (const s of S.signals) {
-    if (s.status === 'PENDENTE' || s.status === 'EXPIRADO') continue;
+    if (s.status === 'PENDENTE' || s.status === 'EXPIRADO' || s.status === 'CANCELADO') continue;
     const b = s.conf >= 93 ? '93-95' : s.conf >= 86 ? '86-92' : s.conf >= 80 ? '80-85' : s.conf >= 70 ? '70-79' : '50-69';
     buckets[b].n++;
     if (s.status !== 'LOSS') buckets[b].w++;
@@ -1430,7 +1514,9 @@ async function becomeLeader() {
     // Só a instância que detém o advisory lock pode carregar estado,
     // consultar a API, apurar sinais ou enviar mensagens.
     await dbLoadState();
+    if (R.erroDB) throw new Error(`PostgreSQL não carregou o estado: ${R.erroDB}`);
     await dbLoadAlltime();
+    if (R.erroDB) throw new Error(`PostgreSQL não carregou estatísticas: ${R.erroDB}`);
     await sync();
     getStats(true);
 
@@ -1477,7 +1563,7 @@ async function start() {
     throw new Error('DATABASE_URL inválido');
   }
 
-  log('BOOT', { versao: '21.5', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
+  log('BOOT', { versao: '21.6', deployId: DEPLOY_ID, fontes: API_SOURCES.length });
   await dbInit();
   if (!pool) throw new Error('Não foi possível inicializar PostgreSQL; arranque cancelado');
 
